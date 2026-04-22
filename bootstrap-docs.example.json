@@ -1,0 +1,20 @@
+[
+  {
+    "path": "/path/to/workspace/AGENTS.md",
+    "shelf": "state",
+    "title": "workspace-agents",
+    "tags": ["workspace", "instructions"]
+  },
+  {
+    "path": "/path/to/workspace/agent-memory/episodes/HERMES-LOG.md",
+    "shelf": "episodes",
+    "title": "hermes-log",
+    "tags": ["timeline", "hermes"]
+  },
+  {
+    "path": "/path/to/workspace/agent-memory/state/NOW.md",
+    "shelf": "state",
+    "title": "now",
+    "tags": ["state", "current"]
+  }
+]
