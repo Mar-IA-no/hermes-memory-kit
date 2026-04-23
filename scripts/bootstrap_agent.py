@@ -5,7 +5,13 @@ A workspace is a single directory that contains everything an agent needs:
 
   <agent_dir>/
     AGENTS.md                     operator-facing notes for this agent
-    .env                          all HMK_* paths + API keys + platform tokens
+    .env                          symlink → hermes-home/.env (canonical)
+                                  Canonical .env lives in hermes-home/ because
+                                  Hermes upstream rewrites it via os.replace()
+                                  (atomic rename) — a symlink there would be
+                                  broken on first write. Symlink inversion puts
+                                  the real file where Hermes writes, and a
+                                  stable symlink where hmk/systemd read.
     hermes-home/                  HERMES_HOME (Hermes Agent reads this)
       config.yaml                 gateway config
       SOUL.md                     identity / style
@@ -157,14 +163,6 @@ def bootstrap(agent_dir: Path, name: str, with_wiki_templates: bool) -> None:
     # AGENTS.md (workspace root)
     copy_if_missing(TEMPLATES / "AGENTS.md", agent_dir / "AGENTS.md")
 
-    # .env from template
-    if not (agent_dir / ".env").exists():
-        render_template(ENV_TEMPLATE, agent_dir / ".env", values)
-        try:
-            os.chmod(agent_dir / ".env", 0o600)
-        except Exception:
-            pass
-
     # hermes-home/ skeleton
     hh = agent_dir / "hermes-home"
     hh.mkdir(exist_ok=True)
@@ -260,6 +258,28 @@ def bootstrap(agent_dir: Path, name: str, with_wiki_templates: bool) -> None:
             except Exception:
                 pass
 
+    # .env: canonical in hermes-home/ (Hermes upstream writes it via os.replace()
+    # in config.py:3292/3395/3451; a symlink there would be broken on first write).
+    # agent_root/.env is a relative symlink so hmk wrapper and systemd
+    # EnvironmentFile= can read via either path.
+    hh_env = hh / ".env"
+    root_env = agent_dir / ".env"
+    if not hh_env.exists():
+        render_template(ENV_TEMPLATE, hh_env, values)
+        try:
+            os.chmod(hh_env, 0o600)
+        except Exception:
+            pass
+    # Symlink agent_root/.env -> hermes-home/.env (relative path for portability)
+    if not root_env.exists() and not root_env.is_symlink():
+        try:
+            os.symlink("hermes-home/.env", root_env)
+        except FileExistsError:
+            pass
+        except Exception as exc:
+            print(f"warning: could not create .env symlink at {root_env}: {exc}")
+
+
 
 def upgrade(agent_dir: Path) -> None:
     """Refresh tooling in an existing v3 workspace. Preserves user data."""
@@ -324,7 +344,10 @@ def print_next_steps(agent_dir: Path, name: str) -> None:
     print("  git clone https://github.com/NousResearch/hermes-agent.git app")
     print("  python3 -m venv venv && ./venv/bin/pip install -e ./app")
     print("  # 3. Enable the systemd user service:")
-    print("  cp scripts/../templates/systemd/hermes-gateway@.service \\")
+    # The kit's systemd template is NOT copied into the agent workspace;
+    # emit absolute path so users can cp directly from the kit.
+    kit_unit = REPO_ROOT / "templates" / "systemd" / "hermes-gateway@.service"
+    print(f"  cp {kit_unit} \\")
     print("     ~/.config/systemd/user/")
     print("  systemctl --user daemon-reload")
     if is_standard:

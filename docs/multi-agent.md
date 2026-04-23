@@ -9,13 +9,21 @@ For each agent, everything it needs lives inside its own workspace:
 ```
 ~/agents/<name>/
 ├── AGENTS.md            operator-facing notes
-├── .env                 all HMK_* paths + API keys + tokens
+├── .env                 symlink → hermes-home/.env (canonical)
 ├── hermes-home/         HERMES_HOME — config, SOUL, memories, sessions, plugins
+│   └── .env             ← canonical real file (Hermes upstream writes here with os.replace)
 ├── agent-memory/        durable memory (library.db, state, episodes, plans, index)
 ├── wiki/                optional projection
 ├── scripts/             tooling (hmk, memoryctl, continuityctl, ...)
 ├── app/                 hermes-agent upstream clone (user installs)
 └── venv/                Python venv for app/ (user creates)
+
+> The `.env` is canonically located at `hermes-home/.env` because Hermes Agent
+> upstream rewrites it via `os.replace()` (atomic rename) in `config.py:3292/3395/3451`
+> — a symlink at that path would be replaced by a regular file on the first save.
+> The symlink in the agent root is relative (`hermes-home/.env`), so both the
+> `hmk` wrapper (reads from workspace root) and the systemd template
+> (`EnvironmentFile=%h/agents/%i/.env`) follow it to the real file.
 ```
 
 Agents **never share** any of: config, SOUL, memory, sessions, plugins, skills, library.db, wiki, or scripts. If you run the library on host Y and configure agent X wrong, X gets an explicit error — it cannot silently fall back into another agent's files.

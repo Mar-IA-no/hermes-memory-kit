@@ -254,15 +254,17 @@ Use everything through the `./scripts/hmk` wrapper so `.env` loads automatically
 
 ## Configuration
 
-The `./scripts/hmk` wrapper loads `.env` from the workspace root, **absolutizes** any relative path against that root, and `cd`s into the workspace before execution. The defaults in `.env.example` use relative paths (`./agent-memory`), so they work without editing.
+Each agent workspace has its `.env` canonically at `hermes-home/.env` (real file) with a relative symlink from the agent root (`agent_root/.env → hermes-home/.env`). This inversion exists because Hermes Agent upstream rewrites `HERMES_HOME/.env` via `os.replace()` (atomic rename), which would destroy a symlink at that path on first save.
 
-Variables (all optional — sensible fallbacks exist):
+The `./scripts/hmk` wrapper loads the `.env` from the workspace root (following the symlink), exports its contents, and `cd`s into the workspace before execution. Bootstrap renders the template at bootstrap time, replacing `{{WORKSPACE_ROOT}}` with the agent's absolute path — so the live `.env` has absolute paths literal, compatible with systemd `EnvironmentFile=` (which does not expand `${VAR}` references).
 
-| Variable | What it is for | Default |
+Variables (all resolved to absolute paths post-bootstrap):
+
+| Variable | What it is for | Example after bootstrap |
 |---|---|---|
-| `HMK_BASE_DIR` | where memory/state/DB live | `./agent-memory` |
-| `HMK_DB_PATH` | SQLite library | `./agent-memory/library.db` |
-| `HMK_VAULT_DIR` | target for Obsidian projection | `./wiki` |
+| `HMK_AGENT_MEMORY_BASE` | where memory/state/DB live (canonical v3) | `/home/onairam/agents/hermes-prime/agent-memory` |
+| `HMK_DB_PATH` | SQLite library | `/home/onairam/agents/hermes-prime/agent-memory/library.db` |
+| `HMK_VAULT_DIR` | target for Obsidian projection | `/home/onairam/agents/hermes-prime/wiki` |
 | `HMK_HERMES_HOME` | Hermes Agent home (for the plugin) | — |
 | `HMK_AGENT_MEMORY_BASE` | alias for BASE_DIR (used by the plugin) | — |
 | `HMK_DIALOGUE_HANDOFF_PATH` | direct path to the handoff (override) | — |

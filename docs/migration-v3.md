@@ -58,20 +58,39 @@ Consider excluding ad-hoc venvs that may be inside the old `agent-memory/` (e.g.
 
 ### 3. Consolidate `.env`
 
-The v3 layout expects a single `.env` at the agent root, not one inside `hermes-home/`. Merge whatever `~/agents/hermes-prime/hermes-home/.env` contains with the HMK_* keys from the `.env.template`:
+The v3 layout has `.env` canonically in `hermes-home/.env` (real file, where Hermes
+Agent upstream rewrites it via `os.replace()` in `config.py:3292/3395/3451`), with a
+relative symlink from the agent root (`agent_root/.env → hermes-home/.env`) so the
+`hmk` wrapper and the systemd template `EnvironmentFile=%h/agents/%i/.env` both
+resolve to the same file. A symlink at `hermes-home/.env` would be destroyed by
+the first atomic-rename write from Hermes.
+
+Merge whatever `~/agents/hermes-prime/hermes-home/.env` contains with the HMK_* keys
+from the `.env.template` (which uses `{{WORKSPACE_ROOT}}` placeholders resolved to
+absolute paths at bootstrap — required for systemd EnvironmentFile= compatibility):
 
 ```bash
 cd ~/agents/hermes-prime
-# start from the template rendered for this agent
+# Render HMK_* block with absolute paths for this agent:
 python3 /path/to/hermes-memory-kit/scripts/bootstrap_agent.py \
-    . --name hermes-prime --upgrade  # NOTE: upgrade on a v3 workspace
-# but we are migrating from v2, so bootstrap --upgrade will refuse.
-# Instead, render .env manually:
-cp /path/to/hermes-memory-kit/.env.template .env
-# then edit: fill HMK_WORKSPACE_ROOT, API keys from the old hermes-home/.env
+    /tmp/render-hermes-prime --name hermes-prime
+# Merge: operational vars from old .env + regenerated HMK_* block
+# (exclude from old: HMK_*, HERMES_HOME, AGENT_MEMORY_BASE, HMK_BASE_DIR only)
+# Install the merged .env as real file in hermes-home/:
+cp <merged-env> ~/agents/hermes-prime/hermes-home/.env
+chmod 600 ~/agents/hermes-prime/hermes-home/.env
+# Create relative symlink from agent root:
+ln -sf hermes-home/.env ~/agents/hermes-prime/.env
 ```
 
-Make sure the new `.env` includes the legacy aliases `HERMES_HOME=${HMK_HERMES_HOME}` and `AGENT_MEMORY_BASE=${HMK_AGENT_MEMORY_BASE}` — Hermes Agent upstream reads the former.
+All HMK_* paths in the merged `.env` must be absolute (e.g.
+`HMK_HERMES_HOME=/home/onairam/agents/hermes-prime/hermes-home`), never
+`${HMK_WORKSPACE_ROOT}/hermes-home` — systemd `EnvironmentFile=` reads values
+literally and does not expand `${VAR}` references.
+
+The legacy aliases `HERMES_HOME` and `AGENT_MEMORY_BASE` must appear in the `.env`
+(Hermes Agent upstream reads `HERMES_HOME` directly); bootstrap writes them
+alongside the HMK_* block.
 
 ### 4. Drop in the v3 plugin + skills
 

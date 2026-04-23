@@ -2,6 +2,27 @@
 
 All notable changes to hermes-memory-kit.
 
+## v3.0.1 — 2026-04-23
+
+### Fixed (critical)
+
+- **`.env.template` uses absolute paths at bootstrap**. Before, rendered `.env` had `${HMK_WORKSPACE_ROOT}/hermes-home` chains that systemd `EnvironmentFile=` reads literally (systemd does NOT expand `${VAR}`). Consequence: gateway started with `HERMES_HOME=${HMK_HERMES_HOME}` string literal and failed before loading anything. Fix: template uses `{{WORKSPACE_ROOT}}` placeholder that `render_template()` replaces with the agent's absolute path — final `.env` has literal paths compatible with systemd.
+
+### Fixed (layout)
+
+- **`.env` canonical location moved from agent root to `hermes-home/.env`**. Hermes Agent upstream rewrites `HERMES_HOME/.env` via `os.replace()` (atomic rename) in `config.py:3292/3395/3451`. A symlink at that path would be replaced by a regular file on the first save. The new layout puts the real file in `hermes-home/.env` and a relative symlink at `agent_root/.env → hermes-home/.env`, so:
+  - Hermes upstream writes to the real file; the symlink stays intact.
+  - `hmk` wrapper reads from agent root (workspace) via the symlink.
+  - systemd template `EnvironmentFile=%h/agents/%i/.env` resolves via the symlink.
+
+### Fixed (UX)
+
+- **`bootstrap_agent.py --next-steps` prints an absolute path** to the kit's systemd template (`<kit>/templates/systemd/hermes-gateway@.service`), not a relative path through the agent's `scripts/..` that does not exist (templates are not copied into agents).
+
+### Docs
+
+- `docs/multi-agent.md`, `docs/migration-v3.md`, and `README.md` all updated to reflect the canonical `hermes-home/.env` + inverted symlink model, with explicit references to `config.py:3292/3395/3451` as the reason for the inversion.
+
 ## v3.0.0 — 2026-04-23 (unreleased)
 
 ### Breaking
