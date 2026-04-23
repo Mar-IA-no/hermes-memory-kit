@@ -49,9 +49,17 @@ your-workspace/
 └── .env
 ```
 
+## Conversational continuity (optional plugin)
+
+The kit ships an optional Hermes Agent plugin at `templates/plugins/dialogue-handoff/` that auto-injects the last conversation's context when a new session starts. No "magic phrases" needed — the user types `continua` and the agent picks up the thread.
+
+See [docs/dialogue-handoff.md](docs/dialogue-handoff.md) for how it works, install steps, and the Hermes version it's pinned against.
+
+The kit is fully usable **without** the plugin — the plugin is an add-on for when you also run Hermes Agent on top of the workspace.
+
 ## Variables principales
 
-Copiá `.env.example` a `.env` y ajustá según tu host.
+Copiá `.env.example` a `.env` dentro del workspace (no del repo) y ajustá según tu host. Los scripts se invocan via el wrapper `./scripts/hmk <script>.py`, que carga el `.env` automáticamente, absolutiza paths relativos contra el workspace root, y hace `cd` al workspace antes de ejecutar.
 
 Variables más importantes:
 

@@ -309,6 +309,7 @@ def write_map_note(mapping):
         ]
     )
     path = VAULT_DIR / "maps" / "project-memory-system.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

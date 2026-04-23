@@ -1,0 +1,51 @@
+#!/bin/bash
+# hmk — Hermes Memory Kit wrapper.
+# Usage: ./scripts/hmk <script-name.py> [args...]
+#        ./scripts/hmk memoryctl.py init
+set -e
+
+# Resolve workspace root: prefer HMK_WORKSPACE_ROOT env; else parent of this
+# script's real location.
+if [ -z "${HMK_WORKSPACE_ROOT:-}" ]; then
+    SCRIPT_REAL="$(readlink -f "${BASH_SOURCE[0]}")"
+    HMK_WORKSPACE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")/.." && pwd)"
+fi
+export HMK_WORKSPACE_ROOT
+
+# Load .env from workspace root if present
+if [ -f "$HMK_WORKSPACE_ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$HMK_WORKSPACE_ROOT/.env"
+    set +a
+fi
+
+# Absolutize any relative HMK_* paths against workspace root.
+# Skip empty and already-absolute values.
+for var in HMK_BASE_DIR HMK_DB_PATH HMK_VAULT_DIR HMK_ENV_FILE \
+           HMK_HERMES_HOME HMK_AGENT_MEMORY_BASE HMK_SESSIONS_DIR \
+           HMK_DIALOGUE_HANDOFF_PATH; do
+    val="${!var:-}"
+    case "$val" in
+        ""|/*) ;;
+        *) export "$var=$HMK_WORKSPACE_ROOT/${val#./}" ;;
+    esac
+done
+
+# Predictable cwd
+cd "$HMK_WORKSPACE_ROOT"
+
+# Target script
+if [ "$#" -lt 1 ]; then
+    echo "usage: hmk <script-name.py> [args...]" >&2
+    exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TARGET="$SCRIPT_DIR/$1"
+shift
+if [ ! -f "$TARGET" ]; then
+    echo "hmk: script not found: $TARGET" >&2
+    exit 2
+fi
+exec python3 "$TARGET" "$@"
