@@ -1,19 +1,19 @@
 # Project Memory System
 
-## Qué es
+## What It Is
 
-- mapa humano del sistema de memoria
-- punto de entrada navegable
-- superficie proyectada, no canónica
+- human map of the memory system
+- navigable entry point
+- projected surface, not canonical
 
-## Regla
+## Rule
 
-- canon primero
-- proyección después
+- canon first
+- projection after
 
-## Próximos mapas posibles
+## Possible Next Maps
 
-- arquitectura
+- architecture
 - research
-- integraciones
-- documentación operativa
+- integrations
+- operational documentation

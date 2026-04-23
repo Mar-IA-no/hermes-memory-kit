@@ -1,13 +1,13 @@
 # Install
 
-## Requisitos mínimos
+## Minimum Requirements
 
 - Python 3.11+
-- SQLite con FTS5
-- `pdftotext` para PDFs
-- `pandoc` recomendado para formatos heterogéneos
+- SQLite with FTS5
+- `pdftotext` for PDFs
+- `pandoc` recommended for heterogeneous formats
 
-## Setup base
+## Base Setup
 
 ```bash
 git clone <repo-url>
@@ -95,9 +95,9 @@ Before relying on a fresh install, run the smoke test once from the repo:
 
 It exercises bootstrap → init → add-text → search → pack → export → upgrade, in a throwaway temp workspace.
 
-## Inicialización
+## Initialization
 
-Desde el workspace o exportando las variables necesarias:
+From the workspace, or after exporting the required variables:
 
 ```bash
 python3 scripts/memoryctl.py init
@@ -105,10 +105,10 @@ python3 scripts/memoryctl.py stats
 python3 scripts/memoryctl.py embed-config
 ```
 
-## Embeddings locales opcionales
+## Optional Local Embeddings
 
 ```bash
 pip install -r requirements-local-embeddings.txt
 ```
 
-No asumir compatibilidad de CPU sin probarla.
+Do not assume CPU compatibility without testing it.

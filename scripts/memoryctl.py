@@ -68,12 +68,12 @@ META_EXACT_PATHS = {
 }
 
 DEFAULT_SHELVES = {
-    "identity": "Identidad, principios y restricciones de maxima prioridad",
-    "state": "Estado operativo actual y contexto vivo",
-    "plans": "Planes, roadmap, arquitectura, backlog y decisiones",
-    "episodes": "Bitacora cronologica y memoria episodica",
-    "library": "Notas destiladas y conocimiento reutilizable",
-    "evidence": "Documentos fuente, reportes y rastros crudos",
+    "identity": "Identity, principles, and highest-priority constraints",
+    "state": "Current operating state and live context",
+    "plans": "Plans, roadmap, architecture, backlog, and decisions",
+    "episodes": "Chronological log and episodic memory",
+    "library": "Distilled notes and reusable knowledge",
+    "evidence": "Source documents, reports, and raw traces",
 }
 
 BOOTSTRAP_DOCS_ENV = os.environ.get("HMK_BOOTSTRAP_DOCS_JSON", "").strip()
@@ -1235,7 +1235,7 @@ def parse_tags(text):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Control de memoria local para Hermes")
+    parser = argparse.ArgumentParser(description="Local memory control for Hermes")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init")

@@ -1,7 +1,7 @@
 # NOW
 
-Estado inicial del sistema:
+Initial system state:
 
-- memorioteca creada
-- DB pendiente de contenido
-- retrieval pendiente de uso real
+- memory store created
+- DB waiting for content
+- retrieval waiting for real use

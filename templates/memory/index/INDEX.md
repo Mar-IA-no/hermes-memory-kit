@@ -1,8 +1,8 @@
 # INDEX
 
-Índice inicial de la memorioteca.
+Initial index of the memory store.
 
-Capas:
+Layers:
 
 - `identity`
 - `state`

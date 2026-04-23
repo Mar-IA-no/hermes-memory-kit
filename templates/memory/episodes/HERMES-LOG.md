@@ -1,3 +1,3 @@
 # HERMES-LOG
 
-Bitácora pública del agente.
+Public log of the agent.

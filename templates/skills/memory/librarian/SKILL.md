@@ -62,8 +62,8 @@ Use this after: model changes, service restart, crash recovery, obvious continui
 
 ### Rule for consumption
 
-- "what were we talking about / ¿en qué estábamos? / recién" → `dialogue_handoff` FIRST. If empty or stale (>6h old based on `last_turn.timestamp`), fallback to `meta_context`.
-- "what are we working on / project status / estado del sistema / roadmap" → `meta_context`.
+- "what were we talking about / where were we / just now" → `dialogue_handoff` FIRST. If empty or stale (>6h old based on `last_turn.timestamp`), fallback to `meta_context`.
+- "what are we working on / project status / system state / roadmap" → `meta_context`.
 - Never quote `meta_context` as if it were the user conversation. It describes the system, not the dialogue.
 
 ### Recovering broader thread context (beyond last turn)
@@ -82,11 +82,11 @@ In that case, ALSO read `session_path` and scan the last ~20 messages for:
 
 Treat recovered context as YOUR OWN memory — not as something to report.
 
-When the user asks "¿en qué estábamos?", "de qué veníamos hablando?", "continua", "recordás lo último?" or similar re-entry cues:
+When the user asks "where were we?", "what were we talking about?", "continue", "do you remember the last thing?" or similar re-entry cues:
 
 - DO absorb the handoff silently and pick up the thread naturally. Examples:
-  - "Dale, seguimos con el PDF de X. Decías que…"
-  - "Veníamos trabajando con X sobre Y. ¿Querés que continúe desde Z?"
+  - "Right, let's continue with the PDF about X. You were saying..."
+  - "We were working on X around Y. Do you want me to continue from Z?"
 - DO NOT list structured fields like `session_id`, timestamps, model, platform, working set paths — that is metadata for the agent, not for the user.
 - DO NOT frame the answer as a "report" with headers/bullets unless the user explicitly asks for a recap or audit.
 - If context is genuinely empty/stale, say so briefly in one sentence and invite the user to reorient.

@@ -1,6 +1,6 @@
 # MEMORY-ARCHITECTURE
 
-Capas:
+Layers:
 
 - identity
 - state
@@ -9,9 +9,9 @@ Capas:
 - library
 - evidence
 
-Reglas:
+Rules:
 
-- canon primero
-- proyección después
-- raw solo bajo demanda
-- `null_retrieval` es válido
+- canon first
+- projection after
+- raw only on demand
+- `null_retrieval` is valid

@@ -1,18 +1,18 @@
 # Curation Pipeline
 
-Flujo:
+Flow:
 
-1. ingesta y normalización
-2. retrieval relacionado
-3. inspección opcional del wiki
-4. decisión de curación
-5. escritura canónica
-6. proyección opcional
+1. ingestion and normalization
+2. related retrieval
+3. optional wiki inspection
+4. curation decision
+5. canonical write
+6. optional projection
 
-Salidas posibles:
+Possible outputs:
 
-- solo `evidence`
+- only `evidence`
 - `evidence` + links
-- `evidence` + nota `library`
-- `evidence` + update wiki
+- `evidence` + `library` note
+- `evidence` + wiki update
 - `evidence` + map note

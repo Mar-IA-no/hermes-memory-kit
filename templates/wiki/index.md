@@ -1,8 +1,8 @@
 # Wiki Index
 
-Vault inicial proyectado para navegación humana.
+Initial projected vault for human navigation.
 
-## Secciones
+## Sections
 
 - `maps/`
 - `projects/`
@@ -11,7 +11,7 @@ Vault inicial proyectado para navegación humana.
 - `synthesis/`
 - `log/`
 
-Recordatorio:
+Reminder:
 
-- este vault no reemplaza `library.db`
-- la verdad factual sigue estando en la memorioteca canónica
+- this vault does not replace `library.db`
+- factual truth still lives in the canonical memory store

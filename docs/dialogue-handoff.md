@@ -96,7 +96,7 @@ The "Last User Message" section should contain your latest input.
 
 ### 5. Test auto-injection end-to-end
 
-Close the Hermes CLI. Open a new session. Type `continua`. The agent should pick up the thread from the previous session naturally — without asking "what were we doing?".
+Close the Hermes CLI. Open a new session. Type `continue`. The agent should pick up the thread from the previous session naturally — without asking "what were we doing?".
 
 ## Env var cascade (reference)
 
@@ -200,24 +200,24 @@ ALWAYS-CONTEXT goes first; the handoff goes last for recency bias. If handoff is
 ```markdown
 # Always-context
 
-## Memoria durable (usar ANTES de grep/find en filesystem)
+## Durable Memory (use BEFORE grep/find on the filesystem)
 - `./scripts/hmk memoryctl.py hybrid-pack --query "..." --limit 4 --threshold 0.4`
 - `./scripts/hmk memoryctl.py search --query "..." --limit 5`
 - `./scripts/hmk memoryctl.py expand --id N`
 
-**Regla**: ante cualquier pregunta sobre conocimiento del workspace,
-probar la library PRIMERO. Si da `null_retrieval`, recién ahí buscar en disco.
+**Rule**: for any question about workspace knowledge,
+try the library FIRST. If it returns `null_retrieval`, only then search on disk.
 
-## Skill de curación
-`skill_view librarian` describe convenciones completas.
+## Curation Skill
+`skill_view librarian` describes the full conventions.
 
-## Re-hidratación táctica
-`./scripts/hmk continuityctl.py rehydrate` devuelve identity + meta_context +
-dialogue_handoff + memorias exactas en un JSON.
+## Tactical Rehydration
+`./scripts/hmk continuityctl.py rehydrate` returns identity + meta_context +
+dialogue_handoff + exact memories in a single JSON.
 
 ## Wiki
-`wiki/` es proyección desde el canon. OK leerla para orientación;
-NO citarla como evidencia — siempre volver a `library.db`.
+`wiki/` is a projection from the canon. It is OK to read for orientation;
+do NOT cite it as evidence — always go back to `library.db`.
 ```
 
 ### Relationship to other files
@@ -232,4 +232,3 @@ NO citarla como evidencia — siempre volver a `library.db`.
 | `ACTIVE-CONTEXT.md` | read on demand | engineering meta-state | operator (Codex-style) |
 
 The distinction from `AGENTS.md`: AGENTS.md gets loaded into the system prompt ONCE at session init (and cached). Kimi and other models sometimes drown its guidance in the rest of the system prompt. ALWAYS-CONTEXT is injected into the user message — position-biased towards recency — which gives the capability reminder much stronger weight per turn.
-

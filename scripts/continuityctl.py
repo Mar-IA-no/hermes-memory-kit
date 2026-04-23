@@ -234,7 +234,7 @@ def load_relevant_memories(max_items: int, max_lines: int):
 
 def build_query():
     sections = load_active_context()
-    query_parts = ["continuidad", "estado actual", "foco activo"]
+    query_parts = ["continuity", "current state", "active focus", "continuidad", "estado actual", "foco activo"]
     for key in ["Active Goal", "Current Focus", "Next Steps", "Last Topic", "Last User Intent"]:
         if key in sections:
             compacted = [compact_phrase(item) for item in split_bullets(sections[key])[:2]]
@@ -328,7 +328,7 @@ def rehydrate(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Control tactico de continuidad para Hermes")
+    parser = argparse.ArgumentParser(description="Tactical continuity control for Hermes")
     sub = parser.add_subparsers(dest="command", required=True)
 
     show = sub.add_parser("show")
