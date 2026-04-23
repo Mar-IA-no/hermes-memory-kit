@@ -1,30 +1,23 @@
-"""dialogue-handoff plugin v2.1 — conversational continuity for Hermes.
+"""dialogue-handoff plugin v3.0 — conversational continuity for Hermes.
+
+v2.1 → v3.0 (BREAKING):
+  - ALL hardcoded fallbacks to /home/onairam/... REMOVED. The plugin now
+    requires the agent's .env to be correctly sourced into the environment
+    with at least HMK_AGENT_MEMORY_BASE (or HMK_DIALOGUE_HANDOFF_PATH /
+    HMK_ALWAYS_CONTEXT_PATH directly) and HMK_HERMES_HOME (or HMK_SESSIONS_DIR
+    directly).
+  - If required paths cannot be resolved from env, the plugin logs an error
+    once and its hooks become no-ops. This prevents cross-agent contamination
+    in multi-agent deployments where a misconfigured .env would otherwise
+    cause one agent to write its handoff into another's tree.
+  - Legacy env vars (AGENT_MEMORY_BASE, HERMES_HOME) still work in the
+    cascade — they're read from the Hermes upstream environment.
 
 v2.0 → v2.1:
-  - NEW: always_context layer. Reads ALWAYS-CONTEXT.md (user-editable,
-    workspace-local) and prepends its content to the injection on
-    is_first_turn. Injected even if the handoff is missing or stale —
-    purpose is to keep imperative capability reminders (e.g. "use
-    memoryctl before grep") always fresh at session start.
-  - The handoff layer is now OPTIONAL. If it fails (missing, stale,
-    empty), the plugin still injects the always_context if present.
-  - Separate budget: ALWAYS-CONTEXT capped at 1000 chars; handoff stays
-    at 6000. Total injection ≤ ~7000 chars / ~1750 tokens.
+  - ALWAYS-CONTEXT layer on is_first_turn.
 
-v1.1 → v2.0:
-  - NEW: pre_llm_call hook. On the first turn of every new session, reads
-    DIALOGUE-HANDOFF.md + the linked session file, builds a tiered-compressed
-    continuity block, and injects it into the user message (never the system
-    prompt, to preserve prompt cache prefix).
-  - Trimming strategy: tier 1 verbatim (last 2 exchanges), tier 2 headlines
-    (exchanges 3-6), tier 3 stride sampling 1-of-3 (exchanges 7-20), tier 4
-    dropped. Position-aware: newest at bottom to beat lost-in-the-middle.
-  - Stale gate: no injection if handoff timestamp is >24h old.
-  - Command gate: no injection if user_message starts with '/'.
-
-v1.0 → v1.1 (preserved):
-  - shell tool path extraction (terminal, execute_code, shell, bash)
-  - session_path resolution
+v1.0 → v2.0:
+  - pre_llm_call hook with tiered-compressed continuity block.
 """
 from __future__ import annotations
 
@@ -34,43 +27,64 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# --- paths -----------------------------------------------------------
+# --- paths ------------------------------------------------------------
+#
+# v3.0: NO hardcoded fallbacks. Either the env resolves, or the plugin
+# disables itself. Cascade order (most specific first):
+#
+#   agent-memory root:
+#     HMK_AGENT_MEMORY_BASE > AGENT_MEMORY_BASE > HMK_BASE_DIR
+#   hermes-home root:
+#     HMK_HERMES_HOME > HERMES_HOME
+#
+# Individual file paths can be overridden directly:
+#   HMK_DIALOGUE_HANDOFF_PATH, HMK_ALWAYS_CONTEXT_PATH, HMK_SESSIONS_DIR.
 
-# Env var cascade: most-specific first, generic last, legacy at the end.
-def _resolve_path(keys, fallback):
+
+def _env_path(keys: list) -> Optional[Path]:
     for k in keys:
         v = os.environ.get(k)
         if v:
             return Path(v).expanduser()
-    return Path(fallback).expanduser()
+    return None
 
-_AGENT_MEMORY_BASE = _resolve_path(
-    ["HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE"],
-    "/home/onairam/agent-memory",
-)
-_HANDOFF_PATH = _resolve_path(
-    ["HMK_DIALOGUE_HANDOFF_PATH"],
-    str(_AGENT_MEMORY_BASE / "state" / "DIALOGUE-HANDOFF.md"),
-)
-_ALWAYS_CONTEXT_PATH = _resolve_path(
-    ["HMK_ALWAYS_CONTEXT_PATH"],
-    str(_AGENT_MEMORY_BASE / "state" / "ALWAYS-CONTEXT.md"),
-)
 
-_HERMES_HOME = _resolve_path(
-    ["HMK_HERMES_HOME", "HERMES_HOME"],
-    "/home/onairam/agents/hermes-prime/hermes-home",
+_AGENT_MEMORY_BASE = _env_path(["HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE", "HMK_BASE_DIR"])
+_HERMES_HOME = _env_path(["HMK_HERMES_HOME", "HERMES_HOME"])
+
+_HANDOFF_PATH: Optional[Path] = _env_path(["HMK_DIALOGUE_HANDOFF_PATH"]) or (
+    (_AGENT_MEMORY_BASE / "state" / "DIALOGUE-HANDOFF.md") if _AGENT_MEMORY_BASE else None
 )
-_SESSIONS_DIR = _resolve_path(
-    ["HMK_SESSIONS_DIR"],
-    str(_HERMES_HOME / "sessions"),
+_ALWAYS_CONTEXT_PATH: Optional[Path] = _env_path(["HMK_ALWAYS_CONTEXT_PATH"]) or (
+    (_AGENT_MEMORY_BASE / "state" / "ALWAYS-CONTEXT.md") if _AGENT_MEMORY_BASE else None
+)
+_SESSIONS_DIR: Optional[Path] = _env_path(["HMK_SESSIONS_DIR"]) or (
+    (_HERMES_HOME / "sessions") if _HERMES_HOME else None
 )
 
-# --- write side (post_llm_call) — v1.1 logic --------------------------
+_CONFIG_OK = bool(_HANDOFF_PATH and _ALWAYS_CONTEXT_PATH and _SESSIONS_DIR)
+
+if not _CONFIG_OK:
+    missing = []
+    if not _HANDOFF_PATH:
+        missing.append("HMK_DIALOGUE_HANDOFF_PATH or HMK_AGENT_MEMORY_BASE")
+    if not _ALWAYS_CONTEXT_PATH:
+        missing.append("HMK_ALWAYS_CONTEXT_PATH or HMK_AGENT_MEMORY_BASE")
+    if not _SESSIONS_DIR:
+        missing.append("HMK_SESSIONS_DIR or HMK_HERMES_HOME")
+    logger.error(
+        "dialogue-handoff v3.0: plugin DISABLED — missing env: %s. "
+        "The plugin will not read or write any handoff/always-context file. "
+        "Set the above vars in the agent's .env (see hermes-memory-kit v3.0 docs).",
+        ", ".join(missing),
+    )
+
+
+# --- write side (post_llm_call) --------------------------------------
 
 _FILE_TOOLS_WITH_PATH = {"read_file", "write_file", "search_files", "patch"}
 _SHELL_TOOLS = {"terminal", "execute_code", "shell", "bash"}
@@ -135,7 +149,7 @@ def _extract_working_set(history: List[Dict[str, Any]]) -> List[str]:
 
 
 def _resolve_session_path(session_id: str) -> str:
-    if not session_id:
+    if not session_id or not _SESSIONS_DIR:
         return ""
     candidates = [
         _SESSIONS_DIR / f"session_{session_id}.json",
@@ -173,6 +187,8 @@ def _on_post_llm_call(
     platform: str = "",
     **_ignored: Any,
 ) -> None:
+    if not _CONFIG_OK or _HANDOFF_PATH is None:
+        return
     try:
         um = (user_message or "").strip()
         if not um or um.startswith("/") or len(um) < 3:
@@ -220,7 +236,7 @@ def _on_post_llm_call(
         logger.warning("dialogue-handoff post_llm_call failed: %s", e)
 
 
-# --- read side (pre_llm_call) — v2.0 new logic ------------------------
+# --- read side (pre_llm_call) ----------------------------------------
 
 _STALE_HOURS = 24
 _BUDGET_CHARS = 6000
@@ -229,13 +245,12 @@ _TIER2_CHARS = 150
 _TIER3_CHARS = 80
 _TIER3_STRIDE = 3
 
-# ALWAYS-CONTEXT layer (v2.1): user-editable imperative reminders that get
-# injected into every is_first_turn, even when handoff is missing/stale.
 _ALWAYS_CONTEXT_BUDGET = 1500
 
 
 def _load_always_context() -> str:
-    """Return ALWAYS-CONTEXT.md content (capped), or "" if missing/unreadable."""
+    if not _CONFIG_OK or _ALWAYS_CONTEXT_PATH is None:
+        return ""
     try:
         if not _ALWAYS_CONTEXT_PATH.exists():
             return ""
@@ -325,9 +340,6 @@ def _load_session_messages(session_path: str) -> List[Dict[str, Any]]:
         raw = p.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return []
-    # Try raw_decode — tolerates trailing garbage (common after gateway SIGTERM
-    # during write; the session JSON is valid up to some point, then binary
-    # junk follows). raw_decode parses the first JSON object and ignores rest.
     try:
         decoder = json.JSONDecoder()
         data, _end = decoder.raw_decode(raw.lstrip())
@@ -337,7 +349,6 @@ def _load_session_messages(session_path: str) -> List[Dict[str, Any]]:
             return data
     except json.JSONDecodeError:
         pass
-    # Fallback: JSONL (for genuine JSONL files, one JSON object per line)
     out = []
     for ln in raw.splitlines():
         ln = ln.strip()
@@ -353,7 +364,6 @@ def _load_session_messages(session_path: str) -> List[Dict[str, Any]]:
 
 
 def _msg_text(msg: Dict[str, Any]) -> str:
-    """Extract plain text content from a message, handling multi-part format."""
     c = msg.get("content", "")
     if isinstance(c, str):
         return c.strip()
@@ -371,7 +381,6 @@ def _msg_text(msg: Dict[str, Any]) -> str:
 
 
 def _group_exchanges(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Pair user↔assistant into exchanges. Returns newest-first."""
     exchanges = []
     current_user = None
     assistant_parts: List[str] = []
@@ -396,7 +405,7 @@ def _group_exchanges(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             "user": current_user,
             "assistant": "\n".join(assistant_parts).strip(),
         })
-    exchanges.reverse()  # newest first
+    exchanges.reverse()
     return exchanges
 
 
@@ -429,7 +438,6 @@ def _build_injection(handoff: Dict[str, Any], exchanges: List[Dict[str, str]], b
     t3 = exchanges[6:20]
     t3_strided = [ex for i, ex in enumerate(t3) if i % _TIER3_STRIDE == 0]
 
-    # Chronological order: oldest sparse → newest verbatim
     if t3_strided:
         lines.append("### Earlier arc (sparse 1-of-3 sampling, ~80 chars):")
         for ex in reversed(t3_strided):
@@ -465,7 +473,6 @@ def _build_injection(handoff: Dict[str, Any], exchanges: List[Dict[str, str]], b
     out = "\n".join(lines)
 
     if len(out) > budget:
-        # Hard-cap if still over (T3 first to drop would require rebuild; for v1 we just truncate cleanly)
         cutoff = budget - len("\n[truncated]\n</previous_session_context>")
         out = out[:cutoff].rstrip() + "\n[truncated]\n</previous_session_context>"
     return out
@@ -478,28 +485,22 @@ def _on_pre_llm_call(
     is_first_turn: bool = False,
     **_ignored: Any,
 ) -> Any:
+    if not _CONFIG_OK:
+        return None
     try:
-        # Gate 1: only on first turn of a new session
         if not is_first_turn:
             return None
-        # Gate 2: don't inject on command turns (/reset, /model, etc.)
         um = (user_message or "").strip()
         if um.startswith("/"):
             return None
 
-        # Layer 1 (v2.1): always-context — imperative reminders that must
-        # survive even when the handoff layer has nothing useful. Injected
-        # first so handoff (more recent) sits at the end for recency bias.
         always_block = _load_always_context()
 
-        # Layer 2: dialogue handoff — tiered-compressed arc of the last
-        # conversation. Optional: failure here does not abort injection.
         handoff_block = ""
         try:
-            if _HANDOFF_PATH.exists():
+            if _HANDOFF_PATH is not None and _HANDOFF_PATH.exists():
                 text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
                 handoff = _parse_handoff_md(text)
-                # Only build handoff if it has real content + is fresh
                 if (handoff.get("last_user_message")
                         and handoff.get("last_user_message") != "none"
                         and not _is_stale(handoff)):
@@ -512,7 +513,6 @@ def _on_pre_llm_call(
         except Exception as exc:
             logger.warning("dialogue-handoff: handoff build failed: %s", exc)
 
-        # Nothing to inject? return None (no-op for the hook)
         if not always_block and not handoff_block:
             return None
 

@@ -8,24 +8,45 @@ import memoryctl
 
 
 import os as _os
+import sys as _sys
 
-def _resolve(keys, fallback):
+
+def _resolve(keys):
+    """v3.0: resolve path from env cascade. Returns None if none set."""
     for k in keys:
         v = _os.environ.get(k)
         if v:
             return Path(v).expanduser()
-    return Path(fallback).expanduser()
+    return None
 
-AGENT_MEMORY_BASE = _resolve(["HMK_AGENT_MEMORY_BASE", "HMK_BASE_DIR", "AGENT_MEMORY_BASE"], "/home/onairam/agent-memory")
+
+def _require(name: str, value):
+    if value is None:
+        _sys.stderr.write(
+            f"ERROR: continuityctl needs {name} resolvable from env.\n"
+            "       Load your agent's .env before running. The 'hmk' wrapper\n"
+            "       does this automatically. See hermes-memory-kit v3.0 docs.\n"
+        )
+        _sys.exit(2)
+    return value
+
+
+AGENT_MEMORY_BASE = _resolve(["HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE", "HMK_BASE_DIR"])
+HERMES_HOME = _resolve(["HMK_HERMES_HOME", "HERMES_HOME"])
+
+# The module-level constants below are lazy-built from the cascade roots.
+# If roots are None, downstream functions will hit _require() and hard-fail.
 BASE_DIR = AGENT_MEMORY_BASE
-STATE_DIR = BASE_DIR / "state"
-ACTIVE_CONTEXT_PATH = STATE_DIR / "ACTIVE-CONTEXT.md"
-NOW_PATH = STATE_DIR / "NOW.md"
-DIALOGUE_HANDOFF_PATH = _resolve(["HMK_DIALOGUE_HANDOFF_PATH"], str(STATE_DIR / "DIALOGUE-HANDOFF.md"))
-HERMES_HOME = _resolve(["HMK_HERMES_HOME", "HERMES_HOME"], "/home/onairam/agents/hermes-prime/hermes-home")
-SOUL_PATH = HERMES_HOME / "SOUL.md"
-USER_PATH = HERMES_HOME / "memories" / "USER.md"
-MEMORY_PATH = HERMES_HOME / "memories" / "MEMORY.md"
+STATE_DIR = (BASE_DIR / "state") if BASE_DIR else None
+ACTIVE_CONTEXT_PATH = (STATE_DIR / "ACTIVE-CONTEXT.md") if STATE_DIR else None
+NOW_PATH = (STATE_DIR / "NOW.md") if STATE_DIR else None
+DIALOGUE_HANDOFF_PATH = (
+    _resolve(["HMK_DIALOGUE_HANDOFF_PATH"])
+    or ((STATE_DIR / "DIALOGUE-HANDOFF.md") if STATE_DIR else None)
+)
+SOUL_PATH = (HERMES_HOME / "SOUL.md") if HERMES_HOME else None
+USER_PATH = (HERMES_HOME / "memories" / "USER.md") if HERMES_HOME else None
+MEMORY_PATH = (HERMES_HOME / "memories" / "MEMORY.md") if HERMES_HOME else None
 
 
 def read_text(path: Path) -> str:
@@ -328,6 +349,8 @@ def rehydrate(args):
 
 
 def main():
+    _require("HMK_AGENT_MEMORY_BASE", AGENT_MEMORY_BASE)
+    _require("HMK_HERMES_HOME", HERMES_HOME)
     parser = argparse.ArgumentParser(description="Tactical continuity control for Hermes")
     sub = parser.add_subparsers(dest="command", required=True)
 

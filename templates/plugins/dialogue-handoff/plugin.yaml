@@ -1,7 +1,7 @@
 name: dialogue-handoff
-version: 2.1.0
-description: "Conversational continuity for Hermes. Writes DIALOGUE-HANDOFF.md on each non-trivial turn (post_llm_call), and auto-injects tiered-compressed continuity context on the first turn of every new session (pre_llm_call). Separates real user<->Hermes dialogue from meta-engineering state in ACTIVE-CONTEXT.md."
-author: "local (onairam)"
+version: 3.0.0
+description: "Conversational continuity for Hermes. Writes DIALOGUE-HANDOFF.md on each non-trivial turn (post_llm_call), and auto-injects tiered-compressed continuity + always-context on the first turn of every new session (pre_llm_call). v3.0 removed all hardcoded path fallbacks — the plugin now requires HMK_AGENT_MEMORY_BASE (or direct HMK_DIALOGUE_HANDOFF_PATH/HMK_ALWAYS_CONTEXT_PATH) and HMK_HERMES_HOME (or HMK_SESSIONS_DIR) in the agent's .env; otherwise it disables itself to prevent cross-agent contamination."
+author: "hermes-memory-kit"
 provides_hooks:
   - post_llm_call
   - pre_llm_call

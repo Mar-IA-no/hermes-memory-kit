@@ -13,14 +13,61 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_BASE_DIR = REPO_ROOT / "agent-memory"
-BASE_DIR = Path(os.environ.get("HMK_BASE_DIR", str(DEFAULT_BASE_DIR))).expanduser()
-DB_PATH = Path(os.environ.get("HMK_DB_PATH", str(BASE_DIR / "library.db"))).expanduser()
-HERMES_ENV_PATH = Path(
-    os.environ.get("HMK_ENV_FILE", str(Path.home() / ".hermes" / ".env"))
-).expanduser()
+
+# v3.0: NO hardcoded fallbacks. Cascade resolves from env; if none is set,
+# BASE_DIR / DB_PATH / HERMES_HOME remain None and _require_config() hard-fails
+# any command that needs them. This prevents silent cross-agent pollution.
+#
+# Canonical var from v3.0: HMK_AGENT_MEMORY_BASE. HMK_BASE_DIR and
+# AGENT_MEMORY_BASE remain accepted for back-compat.
+
+
+def _resolve_base_dir():
+    for k in ("HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE", "HMK_BASE_DIR"):
+        v = os.environ.get(k)
+        if v:
+            return Path(v).expanduser()
+    return None
+
+
+def _resolve_hermes_home():
+    for k in ("HMK_HERMES_HOME", "HERMES_HOME"):
+        v = os.environ.get(k)
+        if v:
+            return Path(v).expanduser()
+    return None
+
+
+BASE_DIR = _resolve_base_dir()
+_db_env = os.environ.get("HMK_DB_PATH")
+DB_PATH = (
+    Path(_db_env).expanduser() if _db_env
+    else ((BASE_DIR / "library.db") if BASE_DIR else None)
+)
+HERMES_HOME = _resolve_hermes_home()
+_env_file_env = os.environ.get("HMK_ENV_FILE")
+HERMES_ENV_PATH = (
+    Path(_env_file_env).expanduser() if _env_file_env
+    else ((HERMES_HOME / ".env") if HERMES_HOME else None)
+)
 WORKSPACE_ROOT = Path(os.environ.get("HMK_WORKSPACE_ROOT", str(Path.cwd()))).expanduser()
-HERMES_HOME = Path(os.environ.get("HMK_HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+
+
+def _require_config(purpose: str = "this operation"):
+    """Hard-fail if HMK_AGENT_MEMORY_BASE / HMK_DB_PATH cannot be resolved.
+
+    Called by any command that reads/writes the library DB. Prevents silent
+    fallback to a shared default path that would clobber another agent.
+    """
+    if BASE_DIR is None or DB_PATH is None:
+        sys.stderr.write(
+            f"ERROR: memoryctl needs HMK_AGENT_MEMORY_BASE (canonical) or\n"
+            f"       AGENT_MEMORY_BASE / HMK_BASE_DIR / HMK_DB_PATH in the\n"
+            f"       environment for {purpose}. Load your agent's .env before\n"
+            f"       running — the 'hmk' wrapper does this automatically.\n"
+            f"       See hermes-memory-kit v3.0 docs/migration-v3.md.\n"
+        )
+        sys.exit(2)
 LEGACY_ROOT = os.environ.get("HMK_LEGACY_ROOT", "").strip()
 DEFAULT_EMBED_PROVIDER = "nvidia"
 DEFAULT_EMBED_MODELS = {
@@ -55,11 +102,11 @@ PROJECT_QUERY_TERMS = {
     "embeddings",
 }
 BIBLIOTECA_PREFIX = os.environ.get("HMK_LIBRARY_CORPUS_PREFIX", "").strip()
-META_PATH_PREFIXES = [
-    str(WORKSPACE_ROOT / "docs"),
-    str(BASE_DIR),
-    str(HERMES_HOME),
-]
+META_PATH_PREFIXES = [str(WORKSPACE_ROOT / "docs")]
+if BASE_DIR is not None:
+    META_PATH_PREFIXES.append(str(BASE_DIR))
+if HERMES_HOME is not None:
+    META_PATH_PREFIXES.append(str(HERMES_HOME))
 if LEGACY_ROOT:
     META_PATH_PREFIXES.append(LEGACY_ROOT)
 META_EXACT_PATHS = {
@@ -109,6 +156,7 @@ def load_bootstrap_docs():
 
 
 def connect():
+    _require_config("opening the library DB")
     ensure_dirs()
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
@@ -175,6 +223,7 @@ def migrate_embedding_table(con):
 
 
 def init_db():
+    _require_config("initializing the library DB")
     con = connect()
     con.executescript(
         """
@@ -421,7 +470,10 @@ def cosine_similarity(a, b):
 def read_env_key(name):
     if name in os.environ:
         return os.environ[name]
-    if HERMES_ENV_PATH.exists():
+    # v3.0: HERMES_ENV_PATH may be None if neither HMK_ENV_FILE nor
+    # HMK_HERMES_HOME / HERMES_HOME are set. In that case, fall back to
+    # env-only lookup (above) and return None.
+    if HERMES_ENV_PATH is not None and HERMES_ENV_PATH.exists():
         for line in HERMES_ENV_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith(name + "="):
                 return line.split("=", 1)[1].strip()
