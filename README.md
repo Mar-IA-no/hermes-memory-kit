@@ -3,29 +3,29 @@
 </p>
 
 <p align="center">
-  <em>Operational memory stack for Hermes-style agents — durable canon + handoff + auto-injected continuity across sessions.</em>
+  <em>Self-contained scaffold for Hermes-style agents — per-agent directory with durable memory, continuity handoff, config, plugins, and systemd unit template.</em>
 </p>
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/Hermes-v0.10.0-e710bb1f.svg" alt="Hermes pinned">
-  <img src="https://img.shields.io/badge/status-hardening-orange.svg" alt="Status">
+  <img src="https://img.shields.io/badge/version-v3.0-blue.svg" alt="Version v3.0">
 </p>
 
 ---
 
 ## TL;DR
 
-**Hermes Memory Kit** is not just a SQLite memory store. It is an **operational memory stack for agents**: durable canon (`library.db`), curated retrieval, conversational handoff after crash/restart, and auto-injected continuity on re-entry.
+**Hermes Memory Kit v3** is a scaffold for deploying self-contained Hermes agents. One command creates a full agent workspace: `hermes-home/` (config, SOUL, memories, plugins, skills, sessions), `agent-memory/` (durable library with FTS5 + embeddings, tiered conversational handoff, auto-injected continuity), `wiki/` (optional canonical projection), `scripts/` (tooling), and a per-agent `.env`. A systemd user-service template lets you enable one Hermes instance per directory with a single `systemctl` command.
 
-The core idea is this:
+The core idea:
 
-> **Agent memory is not just what gets stored; it is also what the agent can automatically reabsorb when it comes back.**
+> **One agent = one directory. Nothing shared between agents except the host filesystem.**
 
-A single command bootstraps a self-contained workspace. If you also run Hermes Agent, the `dialogue-handoff` plugin turns that workspace into a memory layer that **survives restarts, session resets, and continuity loss** without manual copy-paste.
+Multiple agents on one host get full isolation: distinct config, SOUL, memory DB, sessions, plugins, wiki. No default paths, no silent fallbacks — if an agent's `.env` is misconfigured, scripts hard-fail instead of writing into another agent's tree.
 
-No Docker, no Postgres, no heavyweight services. One SQLite file + Python scripts + a shell wrapper.
+No Docker, no Postgres, no heavyweight services. One SQLite file per agent + Python scripts + a shell wrapper + a systemd unit template.
 
 ---
 
@@ -51,6 +51,7 @@ No Docker, no Postgres, no heavyweight services. One SQLite file + Python script
 ## Who Is It For?
 
 - You run **Hermes Agent** (or a similar agent framework) and need your agent to **pick the thread back up** across sessions without re-explaining everything.
+- You run **several agents on the same host** and want each one fully isolated (memory, config, SOUL, sessions).
 - You want a **local memory layer** without sending your data to cloud services.
 - Your hardware is modest. SQLite plus API embeddings is enough; no need for Docker + Postgres + Neo4j.
 - You want a **librarian** deciding what context to retrieve and inject, not an indiscriminate memory dump.
@@ -60,7 +61,7 @@ No Docker, no Postgres, no heavyweight services. One SQLite file + Python script
 
 ## Quick Start
 
-> 💡 **Requirement**: Python 3.10+.
+> 💡 **Requirement**: Python 3.10+, a Linux host for systemd integration.
 
 ```bash
 # 1. Clone the kit
@@ -70,22 +71,31 @@ cd hermes-memory-kit
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Bootstrap your workspace (self-contained: scripts, plugins, templates)
-python3 scripts/bootstrap_workspace.py --workspace ~/my-workspace --with-wiki-templates
+# 3. Bootstrap an agent (self-contained directory with hermes-home, memory, wiki, scripts)
+python3 scripts/bootstrap_agent.py ~/agents/hermes-alfa --name hermes-alfa --with-wiki-templates
 
-# 4. Configure + initialize
-cd ~/my-workspace
-cp .env.example .env        # edit if needed; defaults are relative to the workspace
+# 4. Fill in API keys and persona
+cd ~/agents/hermes-alfa
+vim .env        # NVIDIA_API_KEY, platform tokens, optional budget cap
+vim hermes-home/SOUL.md        # agent identity
+vim hermes-home/memories/USER.md       # operator profile
+
+# 5. Initialize memory (optional — on first interaction it is created anyway)
 ./scripts/hmk memoryctl.py init
 
-# 5. Store and retrieve
-./scripts/hmk memoryctl.py add-text --shelf library --title "hello" --raw "my first memory" --tags note
-./scripts/hmk memoryctl.py hybrid-pack --query "hello" --limit 3
+# 6. Install Hermes Agent runtime in the agent's venv
+git clone https://github.com/NousResearch/hermes-agent.git app
+python3 -m venv venv && ./venv/bin/pip install -e ./app
+
+# 7. Enable the systemd user service
+cp ../../hermes-memory-kit/templates/systemd/hermes-gateway@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-gateway@hermes-alfa.service
 ```
 
-That is it. The DB lives at `~/my-workspace/agent-memory/library.db` and you can run the scripts through the `./scripts/hmk` wrapper.
+Every path above is per-agent. To run a second agent, repeat steps 3-7 with a different name. Neither sees the other's memory, config, or sessions.
 
-If you run Hermes Agent, the next step is enabling `plugins/dialogue-handoff/`: that is where the kit stops being just storage and becomes **operational memory with automatic re-entry**.
+**Memory-only use**: If you just want the memory layer without `hermes-home/` and systemd, you can still run `memoryctl.py` and `hybrid-pack` against the workspace's `agent-memory/` — just load the agent's `.env` first (the `./scripts/hmk` wrapper does this automatically).
 
 ---
 
@@ -99,7 +109,9 @@ If you run Hermes Agent, the next step is enabling `plugins/dialogue-handoff/`: 
 | 🗺 **export_obsidian** | `scripts/export_obsidian.py` | projects the canon into an Obsidian / LLM wiki vault |
 | 🔁 **continuityctl** | `scripts/continuityctl.py` | tactical rehydration after restart/crash — returns identity + meta_context + dialogue_handoff as consumable JSON |
 | ⚙️ **hmk wrapper** | `scripts/hmk` | shell wrapper that loads `.env`, absolutizes relative paths, and `cd`s into the workspace |
-| 📋 **templates** | `templates/` | AGENTS.md + librarian skill + memory structure ready for your workspace |
+| 📋 **templates** | `templates/` | AGENTS.md + librarian skill + memory structure + hermes-home skeleton + systemd unit |
+| ⚙️ **bootstrap_agent** | `scripts/bootstrap_agent.py` | creates a new self-contained agent directory (replaces `bootstrap_workspace.py`) |
+| 🔌 **systemd template** | `templates/systemd/hermes-gateway@.service` | user-service template — one unit per agent via `@<name>` |
 | 🧪 **smoke-test** | `scripts/smoke-test.sh` | end-to-end kit verification |
 
 ---
@@ -156,35 +168,46 @@ Without the plugin, the kit is still a good local memory store. With the plugin,
 
 ---
 
-## Workspace Layout
+## Agent Layout
 
-After `bootstrap_workspace.py --workspace ~/my-workspace --with-wiki-templates`:
+After `bootstrap_agent.py ~/agents/hermes-alfa --name hermes-alfa --with-wiki-templates`:
 
 ```text
-my-workspace/
-├── AGENTS.md                     ← agent guidance for using the kit
-├── .env.example                  ← copy to .env and adjust
-├── scripts/
-│   ├── hmk                       ← wrapper — loads .env, cd to workspace
-│   ├── memoryctl.py              ← main CLI
-│   ├── ingest_any.py
-│   ├── export_obsidian.py
-│   ├── continuityctl.py
-│   └── smoke-test.sh
+~/agents/hermes-alfa/
+├── AGENTS.md                     ← operator notes for this agent
+├── .env                          ← HMK_* paths + API keys + tokens (per-agent)
+├── scripts/                      ← tooling (hmk, memoryctl, continuityctl, ...)
+├── hermes-home/                  ← HERMES_HOME: what Hermes Agent reads
+│   ├── config.yaml               ← rendered from template with agent name
+│   ├── SOUL.md                   ← agent identity
+│   ├── memories/{MEMORY,USER}.md ← per-turn injected context
+│   ├── plugins/
+│   │   └── dialogue-handoff/     ← continuity plugin (v3.0)
+│   ├── skills/                   ← librarian + custom
+│   └── sessions/                 ← conversation history (written by Hermes)
 ├── agent-memory/
-│   ├── library.db                ← canon (created by memoryctl init)
+│   ├── library.db                ← canon (FTS5 + embeddings — created on init)
 │   ├── state/
-│   │   ├── NOW.md
-│   │   └── DIALOGUE-HANDOFF.md   ← auto-written by plugin
-│   ├── identity/  plans/  episodes/  library/  evidence/  index/
-├── skills/
-│   └── memory/librarian/SKILL.md ← instructs the agent on curation
-├── plugins/
-│   └── dialogue-handoff/         ← re-entry / continuity layer for Hermes
-└── wiki/
-    ├── index.md
-    └── maps/                     ← projection from the canon
+│   │   ├── ALWAYS-CONTEXT.md     ← stable capability reminders
+│   │   ├── DIALOGUE-HANDOFF.md   ← auto-written by plugin after each turn
+│   │   ├── ACTIVE-CONTEXT.md     ← meta / engineering state
+│   │   └── NOW.md                ← live focus snapshot
+│   ├── episodes/  plans/  index/  evidence/  identity/  library/
+├── wiki/                         ← optional projected-canon layer
+├── app/                          ← hermes-agent clone (user-provided)
+└── venv/                         ← Python venv for app/ (user-provided)
 ```
+
+Multiple agents get sibling directories under `~/agents/`:
+
+```text
+~/agents/
+├── hermes-alfa/      ← agent 1 (Sonnet planner, telegram bot)
+├── hermes-beta/      ← agent 2 (DeepSeek, discord bot)
+└── hermes-minecraft-ermitano/   ← agent N (Qwen local, mineflayer bridge)
+```
+
+None of them share memory, SOUL, sessions, plugins, or wiki. See [docs/multi-agent.md](docs/multi-agent.md).
 
 ---
 
