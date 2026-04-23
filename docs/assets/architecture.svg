@@ -1,0 +1,123 @@
+<svg width="1280" height="860" viewBox="0 0 1280 860" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Hermes Memory Kit architecture</title>
+  <desc id="desc">Operational memory stack showing a self-contained workspace with scripts, plugin-driven continuity, canonical SQLite memory, and wiki projection.</desc>
+  <defs>
+    <linearGradient id="bg" x1="120" y1="80" x2="1160" y2="780" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF9F1"/>
+      <stop offset="1" stop-color="#F5F9FF"/>
+    </linearGradient>
+    <linearGradient id="canon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#DCEEFF"/>
+      <stop offset="1" stop-color="#C9E3FF"/>
+    </linearGradient>
+    <linearGradient id="handoff" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFE8CF"/>
+      <stop offset="1" stop-color="#FFD7B1"/>
+    </linearGradient>
+    <linearGradient id="projected" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#DDF6EA"/>
+      <stop offset="1" stop-color="#C9EAD6"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#12345B" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .label { font: 600 15px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #11314f; }
+      .small { font: 600 12px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #5C7288; letter-spacing: 0.08em; text-transform: uppercase; }
+      .note { font: 500 12px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #49627B; }
+      .title { font: 700 28px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #102E4C; }
+      .subtitle { font: 500 16px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4E6478; }
+      .mono { font: 600 13px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; fill: #1C4467; }
+      .pill { font: 600 11px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #274863; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10V0Z" fill="#64819B"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="860" rx="28" fill="url(#bg)"/>
+  <rect x="44" y="40" width="1192" height="780" rx="32" fill="#FFFDF9" stroke="#D9E5EF" stroke-width="2"/>
+
+  <text x="80" y="105" class="title">Hermes Memory Kit</text>
+  <text x="80" y="136" class="subtitle">Canon durable + continuidad reinyectable + proyeccion navegable en un workspace autocontenido</text>
+
+  <rect x="80" y="170" width="1120" height="118" rx="26" fill="#F8FBFF" stroke="#D7E4F1"/>
+  <text x="110" y="204" class="small">Runtime and control surface</text>
+
+  <rect x="110" y="220" width="206" height="44" rx="14" fill="#FFFFFF" stroke="#D7E4F1"/>
+  <text x="132" y="247" class="label">AGENTS.md + librarian</text>
+  <text x="132" y="266" class="note">guidance for the agent</text>
+
+  <rect x="344" y="196" width="302" height="72" rx="18" fill="#FFFFFF" stroke="#D7E4F1"/>
+  <text x="370" y="225" class="label">scripts/</text>
+  <text x="370" y="246" class="mono">hmk  memoryctl  ingest_any  continuityctl</text>
+  <text x="370" y="266" class="mono">export_obsidian</text>
+
+  <rect x="676" y="196" width="244" height="72" rx="18" fill="#FFF7ED" stroke="#F0D1A8"/>
+  <text x="702" y="225" class="label">dialogue-handoff plugin</text>
+  <text x="702" y="246" class="note">writes handoff, injects continuity, survives re-entry</text>
+
+  <rect x="950" y="196" width="220" height="72" rx="18" fill="#F4F8FF" stroke="#D7E4F1"/>
+  <text x="978" y="225" class="label">Hermes Agent runtime</text>
+  <text x="978" y="246" class="note">pre_llm_call + post_llm_call + on_session_start</text>
+
+  <path d="M920 232H950" stroke="#64819B" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <path d="M646 232H676" stroke="#64819B" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <rect x="80" y="322" width="1120" height="356" rx="28" fill="url(#canon)" stroke="#B7D4F0" filter="url(#shadow)"/>
+  <text x="110" y="360" class="small">Operational memory core</text>
+
+  <rect x="110" y="388" width="500" height="250" rx="24" fill="#FFFFFF" stroke="#BDD7EF"/>
+  <text x="140" y="422" class="label">agent-memory/</text>
+  <text x="140" y="445" class="note">identity / state / plans / episodes / library / evidence / index</text>
+
+  <rect x="140" y="474" width="440" height="96" rx="20" fill="#E8F3FF" stroke="#B5D3EF"/>
+  <text x="168" y="507" class="small">Canonical memory</text>
+  <text x="168" y="537" class="label">library.db</text>
+  <text x="168" y="560" class="note">SQLite + FTS5 + embeddings + metadata + links + query logs</text>
+
+  <rect x="640" y="388" width="530" height="250" rx="24" fill="#FFF7ED" stroke="#F0D1A8"/>
+  <text x="670" y="422" class="label">state/ re-entry layer</text>
+  <text x="670" y="445" class="note">the part the agent can reabsorb after crash, restart or new session</text>
+
+  <rect x="670" y="474" width="230" height="54" rx="16" fill="#FFFFFF" stroke="#F0D1A8"/>
+  <text x="692" y="507" class="mono">NOW.md</text>
+  <text x="810" y="507" class="note">operator state</text>
+
+  <rect x="670" y="540" width="230" height="54" rx="16" fill="#FFFFFF" stroke="#F0D1A8"/>
+  <text x="692" y="573" class="mono">ACTIVE-CONTEXT.md</text>
+  <text x="825" y="573" class="note">engineering meta-state</text>
+
+  <rect x="922" y="474" width="218" height="54" rx="16" fill="#FFFFFF" stroke="#F0D1A8"/>
+  <text x="944" y="507" class="mono">DIALOGUE-HANDOFF.md</text>
+  <text x="944" y="523" class="note">last real turn, auto-written</text>
+
+  <rect x="922" y="540" width="218" height="54" rx="16" fill="#FFFFFF" stroke="#F0D1A8"/>
+  <text x="944" y="573" class="mono">ALWAYS-CONTEXT.md</text>
+  <text x="944" y="589" class="note">persistent reminders, always injected</text>
+
+  <path d="M495 268V448" stroke="#64819B" stroke-width="2.5" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+  <text x="510" y="360" class="pill">read / write</text>
+
+  <path d="M798 268V448" stroke="#C9853D" stroke-width="2.5" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+  <text x="815" y="360" class="pill">inject / persist</text>
+
+  <path d="M610 522H640" stroke="#64819B" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="616" y="505" class="pill">rehydrate</text>
+
+  <rect x="80" y="708" width="1120" height="78" rx="24" fill="url(#projected)" stroke="#B7D9C6"/>
+  <text x="110" y="742" class="small">Projected layer</text>
+  <text x="110" y="770" class="label">wiki/</text>
+  <text x="170" y="770" class="note">Obsidian-friendly projection generated from the canon; useful for humans, not the source of truth</text>
+
+  <path d="M360 570V708" stroke="#4E8B68" stroke-width="2.5" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+  <text x="378" y="655" class="pill">export_obsidian</text>
+
+  <rect x="940" y="718" width="216" height="48" rx="16" fill="#F7FFFB" stroke="#B7D9C6"/>
+  <text x="966" y="747" class="mono">maps/ + index.md</text>
+  <text x="966" y="764" class="note">navigable surface</text>
+
+  <rect x="88" y="86" width="12" height="12" rx="6" fill="#2B6CB0"/>
+  <rect x="105" y="86" width="12" height="12" rx="6" fill="#DD8B37"/>
+  <rect x="122" y="86" width="12" height="12" rx="6" fill="#3F8A61"/>
+</svg>

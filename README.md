@@ -106,38 +106,9 @@ Si corrés Hermes Agent, el paso siguiente es activar `plugins/dialogue-handoff/
 
 ## Arquitectura
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│                         TU WORKSPACE                            │
-│                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐   │
-│  │   AGENTS.md  │  │   scripts/   │  │   plugins/          │   │
-│  │  (guía al    │  │   hmk        │  │   dialogue-handoff/ │   │
-│  │   agente)    │  │   memoryctl  │  │   (para Hermes)     │   │
-│  └──────────────┘  │   ingest_any │  └─────────────────────┘   │
-│                    │   export_obs │                             │
-│                    │   continui…  │                             │
-│                    └──────────────┘                             │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                  agent-memory/                            │   │
-│  │   identity/  state/  plans/  episodes/  library/          │   │
-│  │                                                           │   │
-│  │   ┌─────────────────────────────────────────────────┐     │   │
-│  │   │  library.db  (SQLite + FTS5 + vec + metadata)   │     │   │
-│  │   └─────────────────────────────────────────────────┘     │   │
-│  │                                                           │   │
-│  │   state/                                                  │   │
-│  │     NOW.md             ← operator state (manual)          │   │
-│  │     ACTIVE-CONTEXT.md  ← engineering meta-state (manual)  │   │
-│  │     DIALOGUE-HANDOFF.md ← último turn real (plugin auto)  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  wiki/  (capa proyectada, navegable — no canónica)        │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="Arquitectura de Hermes Memory Kit: workspace autocontenido, canon durable en library.db, continuidad reinyectable con dialogue-handoff y capa proyectada wiki." width="980">
+</p>
 
 **Tres capas que juntas forman la memoria operativa**:
 
