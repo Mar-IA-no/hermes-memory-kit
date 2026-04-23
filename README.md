@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>Memorioteca local para agentes tipo Hermes — SQLite + embeddings + auto-inyección de contexto entre sesiones.</em>
+  <em>Sistema de memoria operativa para agentes tipo Hermes — canon durable + handoff + auto-inyección de continuidad entre sesiones.</em>
 </p>
 
 <p align="center">
@@ -17,7 +17,13 @@
 
 ## TL;DR
 
-**Hermes Memory Kit** es un toolkit Python autocontenido para darle a tu agente (Hermes o cualquier otro) **memoria durable** y **continuidad conversacional automática entre sesiones**. Un solo comando monta tu workspace; otro comando opcional instala un plugin en Hermes que auto-recupera el hilo de la última conversación en cada sesión nueva.
+**Hermes Memory Kit** no es solo una memorioteca SQLite. Es un **stack de memoria operativa para agentes**: canon durable (`library.db`), retrieval curado, handoff conversacional tras crash/restart, y auto-inyección de continuidad al volver a entrar.
+
+La idea central del kit es esta:
+
+> **La memoria del agente no es solo lo que se guarda; es también lo que el agente puede reabsorber automáticamente al volver.**
+
+Un comando monta un workspace autocontenido. Si además corrés Hermes Agent, el plugin `dialogue-handoff` convierte ese workspace en una memoria que **sobrevive reinicios, reseteos de sesión y pérdida de hilo** sin depender de copy-paste manual.
 
 No requiere Docker, ni Postgres, ni servicios externos. Un archivo SQLite + scripts Python + un wrapper shell.
 
@@ -29,7 +35,7 @@ No requiere Docker, ni Postgres, ni servicios externos. Un archivo SQLite + scri
 - [Quick start](#quick-start)
 - [Qué incluye](#qué-incluye)
 - [Arquitectura](#arquitectura)
-- [Continuidad conversacional (plugin opcional)](#continuidad-conversacional-plugin-opcional)
+- [Memoria operativa: canon + handoff + auto-inyección](#memoria-operativa-canon--handoff--auto-inyección)
 - [Layout del workspace](#layout-del-workspace)
 - [Comandos esenciales](#comandos-esenciales)
 - [Configuración](#configuración)
@@ -44,10 +50,11 @@ No requiere Docker, ni Postgres, ni servicios externos. Un archivo SQLite + scri
 
 ## ¿Para quién es?
 
-- Sos developer o operador de **Hermes Agent** (o un agent framework similar) y necesitás que tu agente **recuerde** entre sesiones sin tener que copiar-pegar contexto.
+- Sos developer o operador de **Hermes Agent** (o un agent framework similar) y necesitás que tu agente **retome el hilo** entre sesiones sin tener que re-explicarle todo.
 - Querés una capa de **memoria local**, sin mandar tus datos a servicios cloud.
 - Tu hardware es modesto (ej. no querés correr Docker + Postgres + Neo4j). Un SQLite + embeddings via API ya te alcanza.
-- Querés un **bibliotecario** que cure qué contexto inyectar al agente, no un memory dump indiscriminado.
+- Querés un **bibliotecario** que decida qué contexto recuperar e inyectar, no un memory dump indiscriminado.
+- Te importa que la memoria también cubra el caso más molesto de producción: **crash, reset, sesión nueva, agente perdido**.
 
 ---
 
@@ -78,18 +85,20 @@ cp .env.example .env        # editar si querés; defaults son todos relativos al
 
 Eso es todo. La DB vive en `~/mi-workspace/agent-memory/library.db` y podés usar los scripts via el wrapper `./scripts/hmk`.
 
+Si corrés Hermes Agent, el paso siguiente es activar `plugins/dialogue-handoff/`: ahí el kit deja de ser solo storage y pasa a comportarse como **memoria operativa con re-entry automático**.
+
 ---
 
 ## Qué incluye
 
 | Componente | Archivo / path | Qué hace |
 |---|---|---|
-| 📦 **memoryctl** | `scripts/memoryctl.py` | almacenamiento canónico SQLite + FTS5 + embeddings (NVIDIA / Google / local) + retrieval lexical e híbrido |
+| 🧩 **dialogue-handoff plugin** | `templates/plugins/dialogue-handoff/` | capa de auto-inyección de continuidad: recupera el último arco útil al arrancar una sesión nueva |
+| 📦 **memoryctl** | `scripts/memoryctl.py` | canon SQLite + FTS5 + embeddings (NVIDIA / Google / local) + retrieval lexical e híbrido |
 | 🗃 **ingest_any** | `scripts/ingest_any.py` | normaliza PDFs, DOCX, HTML, MD a markdown antes de almacenar |
 | 🗺 **export_obsidian** | `scripts/export_obsidian.py` | proyecta el canon a un vault Obsidian / LLM wiki |
-| 🔁 **continuityctl** | `scripts/continuityctl.py` | re-hidratación táctica tras restart/crash — identity + meta_context + dialogue_handoff en un JSON |
+| 🔁 **continuityctl** | `scripts/continuityctl.py` | re-hidratación táctica tras restart/crash — identity + meta_context + dialogue_handoff en un JSON consumible |
 | ⚙️ **hmk wrapper** | `scripts/hmk` | shell wrapper que carga `.env`, absolutiza paths relativos, hace cd al workspace |
-| 🧩 **dialogue-handoff plugin** | `templates/plugins/dialogue-handoff/` | plugin Hermes opcional — auto-inyecta contexto de sesión previa en cada session nueva |
 | 📋 **templates** | `templates/` | AGENTS.md + librarian skill + estructura de memoria lista para tu workspace |
 | 🧪 **smoke-test** | `scripts/smoke-test.sh` | verificación end-to-end del kit |
 
@@ -130,21 +139,31 @@ Eso es todo. La DB vive en `~/mi-workspace/agent-memory/library.db` y podés usa
 └────────────────────────────────────────────────────────────────┘
 ```
 
-**Dos capas distintas**:
+**Tres capas que juntas forman la memoria operativa**:
 
-- `library.db` → **canon** (fuente de verdad, FTS5 + embeddings, precisa)
+- `library.db` → **canon durable** (fuente de verdad, FTS5 + embeddings, precisa)
+- `DIALOGUE-HANDOFF.md` + `ALWAYS-CONTEXT.md` → **continuidad reinyectable** (lo que el agente necesita reabsorber al volver)
 - `wiki/` → **proyección** (navegación humana tipo Obsidian, generada desde el canon)
 
 
 ---
 
-## Continuidad conversacional (plugin opcional)
+## Memoria operativa: canon + handoff + auto-inyección
 
-El kit trae un plugin para Hermes Agent que resuelve un problema concreto:
+La parte más diferencial del kit no es solo que guarda memoria. Es que la vuelve **usable después de una interrupción real**.
+
+El problema que resuelve no es abstracto:
 
 > **"Abro Hermes, digo 'continua', y me pregunta de qué estábamos hablando."**
 
-El plugin `dialogue-handoff` (v2.1) elimina ese roce con **dos capas**:
+Para este repo, eso **también es memoria del agente**. No es un accesorio al costado del storage. Es la mitad faltante del sistema.
+
+Por eso el kit se apoya en dos piezas complementarias:
+
+- **Canon durable**: `memoryctl.py` + `library.db` guardan y recuperan conocimiento de forma curada.
+- **Continuidad inyectable**: `dialogue-handoff` + `continuityctl.py` permiten que el agente vuelva a entrar con hilo conversacional, working set y recordatorios persistentes.
+
+El plugin `dialogue-handoff` (v2.1) implementa esa segunda mitad con **dos capas**:
 
 - **Capa volátil** (`DIALOGUE-HANDOFF.md`) — el último turno + arco reciente, escrito después de cada interacción vía `post_llm_call`. Tiered-compressed:
 
@@ -163,7 +182,7 @@ Budget: 6000 chars. Position-aware (los más recientes al final para vencer "los
 
 👉 Ver [docs/dialogue-handoff.md](docs/dialogue-handoff.md) para install y wiring.
 
-El kit funciona sin el plugin — es un add-on para quienes también corren Hermes Agent.
+Sin plugin, el kit sigue siendo una buena memorioteca local. Con plugin, pasa a ser una **memoria operativa de re-entry**: el agente no solo recuerda cosas, también **retoma conversación**.
 
 ---
 
@@ -191,7 +210,7 @@ mi-workspace/
 ├── skills/
 │   └── memory/librarian/SKILL.md ← instruye al agente sobre curación
 ├── plugins/
-│   └── dialogue-handoff/         ← copiar a $HERMES_HOME/plugins/ para activarlo
+│   └── dialogue-handoff/         ← capa de re-entry / continuidad para Hermes
 └── wiki/
     ├── index.md
     └── maps/                     ← proyección desde el canon
@@ -274,12 +293,13 @@ Ver [docs/install.md](docs/install.md) para el flujo completo, [docs/providers.m
 ## Principios de diseño
 
 - **Canon primero, proyección después** — `library.db` es verdad; `wiki/` es solo navegación.
+- **La continuidad también es memoria** — crash recovery, session handoff y re-entry no son “nice to have”; son parte del sistema.
 - **Local por default** — SQLite + embeddings por API. Sin servicios pesados.
 - **Embeddings desacoplados** — podés cambiar de provider sin re-ingestar.
 - **Null retrieval OK** — si el top-k no supera el threshold, devuelve vacío (no padding con ruido).
 - **Zero background loops** — nada corre solo salvo que lo pidas.
 - **Workspace autocontenido** — cada workspace es un dir con todo lo necesario; scripts incluidos.
-- **Plugin opt-in** — el plugin de auto-inyección es opcional. El kit funciona perfecto sin él.
+- **Graceful degradation** — sin plugin tenés canon + retrieval; con plugin tenés la experiencia completa de memoria operativa.
 
 ---
 
@@ -287,12 +307,12 @@ Ver [docs/install.md](docs/install.md) para el flujo completo, [docs/providers.m
 
 | Área | Estado |
 |---|---|
+| dialogue-handoff plugin | ✅ v2.1 (always-context + handoff layers), testeado manual con Hermes v0.10.0 |
 | memoryctl (retrieval + storage) | ✅ estable |
 | bootstrap + workspace upgrade | ✅ estable (smoke test pasa) |
 | ingest_any | 🟡 funciona, deps (`mammoth`, `markdownify`, `trafilatura`) deben estar instalados |
 | export_obsidian | ✅ estable |
 | continuityctl | ✅ portado del sistema live, estable |
-| dialogue-handoff plugin | ✅ v2.1 (always-context + handoff layers), testeado manual con Hermes v0.10.0 |
 | CI / pyproject.toml | ⏳ pendiente — por ahora solo smoke test local |
 
 Este repo es una extracción portable del sistema construido en una notebook real de experimentación. Ya está desacoplado de rutas fijas gruesas y cuenta con smoke test. Sigue en fase de hardening; issues y PRs bienvenidos.
