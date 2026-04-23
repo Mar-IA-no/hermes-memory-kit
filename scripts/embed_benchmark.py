@@ -174,8 +174,17 @@ def run_hybrid_pack(query: str, provider: str, model: str, limit: int = 5, budge
 # --- metrics -----------------------------------------------------------
 
 def top_ids(result: Any, k: int = 3) -> List[int]:
-    """Extract top-k chapter IDs from a memoryctl result (hybrid-pack/semantic-search)."""
-    items = result.get("items") if isinstance(result, dict) else []
+    """Extract top-k chapter IDs from a memoryctl result.
+
+    hybrid-pack returns {"items": [...], ...}.
+    semantic-search returns a raw list [...].
+    """
+    if isinstance(result, list):
+        items = result
+    elif isinstance(result, dict):
+        items = result.get("items", [])
+    else:
+        items = []
     if not isinstance(items, list):
         return []
     ids = []
@@ -189,6 +198,10 @@ def top_ids(result: Any, k: int = 3) -> List[int]:
 
 
 def is_null_retrieval(result: Any) -> bool:
+    # hybrid-pack uses dict with null_retrieval flag; semantic-search
+    # returns a raw list, empty = null.
+    if isinstance(result, list):
+        return len(result) == 0
     if isinstance(result, dict):
         if result.get("null_retrieval"):
             return True
