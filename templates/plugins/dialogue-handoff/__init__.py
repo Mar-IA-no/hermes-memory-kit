@@ -1,23 +1,34 @@
-"""dialogue-handoff plugin v3.0 — conversational continuity for Hermes.
+"""dialogue-handoff plugin v3.1 — conversational continuity for Hermes.
 
-v2.1 → v3.0 (BREAKING):
-  - ALL hardcoded fallbacks to /home/onairam/... REMOVED. The plugin now
-    requires the agent's .env to be correctly sourced into the environment
-    with at least HMK_AGENT_MEMORY_BASE (or HMK_DIALOGUE_HANDOFF_PATH /
-    HMK_ALWAYS_CONTEXT_PATH directly) and HMK_HERMES_HOME (or HMK_SESSIONS_DIR
-    directly).
-  - If required paths cannot be resolved from env, the plugin logs an error
-    once and its hooks become no-ops. This prevents cross-agent contamination
-    in multi-agent deployments where a misconfigured .env would otherwise
-    cause one agent to write its handoff into another's tree.
-  - Legacy env vars (AGENT_MEMORY_BASE, HERMES_HOME) still work in the
-    cascade — they're read from the Hermes upstream environment.
+v3.0 → v3.1 (backwards-compat with v3.0 handoffs):
+  - FIX: _trunc() now preserves multi-line content. Previously it kept only
+    the first line of any text with \\n, mutilating markdown responses. Now
+    it truncates to char budget preserving newlines.
+  - NEW: DIALOGUE-HANDOFF.md persists a self-contained `## Recent Exchanges`
+    block — verbatim tail of the last N substantive turns. pre_llm_call reads
+    that directly; no need to reopen session JSON for the canonical injection.
+    (Fallback to JSON reading remains for legacy handoffs without the block.)
+  - NEW: post_llm_call gates trivial turns. If user+asst content is below
+    threshold (_SUBSTANTIVE_MIN_CHARS), metadata is updated but the Recent
+    Exchanges tail is NOT modified — "en qué estábamos?" no longer overwrites
+    the real conversation tail with its trivial echo.
+  - Budgets recalibrated for the new multi-line-preserving policy.
 
-v2.0 → v2.1:
-  - ALWAYS-CONTEXT layer on is_first_turn.
+v2.1 → v3.0 (BREAKING, preserved):
+  - ALL hardcoded fallbacks to /home/onairam/... REMOVED. The plugin requires
+    HMK_DIALOGUE_HANDOFF_PATH / HMK_ALWAYS_CONTEXT_PATH / HMK_SESSIONS_DIR
+    (or HMK_AGENT_MEMORY_BASE + HMK_HERMES_HOME) resolvable via env cascade;
+    otherwise the plugin disables itself (hooks become no-op) and logs an error.
 
-v1.0 → v2.0:
-  - pre_llm_call hook with tiered-compressed continuity block.
+v2.0 → v2.1 (preserved):
+  - ALWAYS-CONTEXT.md layer (user-editable, workspace-local, always injected).
+
+v1.1 → v2.0 (preserved):
+  - pre_llm_call hook. On first turn of new session, injects continuity block.
+
+v1.0 → v1.1 (preserved):
+  - shell tool path extraction (terminal, execute_code, shell, bash)
+  - session_path resolution
 """
 from __future__ import annotations
 
@@ -27,25 +38,15 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# --- paths ------------------------------------------------------------
+# --- paths -----------------------------------------------------------
 #
-# v3.0: NO hardcoded fallbacks. Either the env resolves, or the plugin
-# disables itself. Cascade order (most specific first):
-#
-#   agent-memory root:
-#     HMK_AGENT_MEMORY_BASE > AGENT_MEMORY_BASE > HMK_BASE_DIR
-#   hermes-home root:
-#     HMK_HERMES_HOME > HERMES_HOME
-#
-# Individual file paths can be overridden directly:
-#   HMK_DIALOGUE_HANDOFF_PATH, HMK_ALWAYS_CONTEXT_PATH, HMK_SESSIONS_DIR.
+# v3.0: NO hardcoded fallbacks. Plugin disables itself if env is not set.
 
-
-def _env_path(keys: list) -> Optional[Path]:
+def _resolve_path(keys: List[str]) -> Optional[Path]:
     for k in keys:
         v = os.environ.get(k)
         if v:
@@ -53,33 +54,35 @@ def _env_path(keys: list) -> Optional[Path]:
     return None
 
 
-_AGENT_MEMORY_BASE = _env_path(["HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE", "HMK_BASE_DIR"])
-_HERMES_HOME = _env_path(["HMK_HERMES_HOME", "HERMES_HOME"])
+_AGENT_MEMORY_BASE = _resolve_path(["HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE", "HMK_BASE_DIR"])
+_HERMES_HOME = _resolve_path(["HMK_HERMES_HOME", "HERMES_HOME"])
 
-_HANDOFF_PATH: Optional[Path] = _env_path(["HMK_DIALOGUE_HANDOFF_PATH"]) or (
-    (_AGENT_MEMORY_BASE / "state" / "DIALOGUE-HANDOFF.md") if _AGENT_MEMORY_BASE else None
+_HANDOFF_PATH = (
+    _resolve_path(["HMK_DIALOGUE_HANDOFF_PATH"])
+    or (_AGENT_MEMORY_BASE / "state" / "DIALOGUE-HANDOFF.md" if _AGENT_MEMORY_BASE else None)
 )
-_ALWAYS_CONTEXT_PATH: Optional[Path] = _env_path(["HMK_ALWAYS_CONTEXT_PATH"]) or (
-    (_AGENT_MEMORY_BASE / "state" / "ALWAYS-CONTEXT.md") if _AGENT_MEMORY_BASE else None
+_ALWAYS_CONTEXT_PATH = (
+    _resolve_path(["HMK_ALWAYS_CONTEXT_PATH"])
+    or (_AGENT_MEMORY_BASE / "state" / "ALWAYS-CONTEXT.md" if _AGENT_MEMORY_BASE else None)
 )
-_SESSIONS_DIR: Optional[Path] = _env_path(["HMK_SESSIONS_DIR"]) or (
-    (_HERMES_HOME / "sessions") if _HERMES_HOME else None
+_SESSIONS_DIR = (
+    _resolve_path(["HMK_SESSIONS_DIR"])
+    or (_HERMES_HOME / "sessions" if _HERMES_HOME else None)
 )
 
-_CONFIG_OK = bool(_HANDOFF_PATH and _ALWAYS_CONTEXT_PATH and _SESSIONS_DIR)
-
+_CONFIG_OK = all([_HANDOFF_PATH, _ALWAYS_CONTEXT_PATH, _SESSIONS_DIR])
 if not _CONFIG_OK:
     missing = []
     if not _HANDOFF_PATH:
-        missing.append("HMK_DIALOGUE_HANDOFF_PATH or HMK_AGENT_MEMORY_BASE")
+        missing.append("HMK_DIALOGUE_HANDOFF_PATH (or HMK_AGENT_MEMORY_BASE)")
     if not _ALWAYS_CONTEXT_PATH:
-        missing.append("HMK_ALWAYS_CONTEXT_PATH or HMK_AGENT_MEMORY_BASE")
+        missing.append("HMK_ALWAYS_CONTEXT_PATH (or HMK_AGENT_MEMORY_BASE)")
     if not _SESSIONS_DIR:
-        missing.append("HMK_SESSIONS_DIR or HMK_HERMES_HOME")
+        missing.append("HMK_SESSIONS_DIR (or HMK_HERMES_HOME)")
     logger.error(
-        "dialogue-handoff v3.0: plugin DISABLED — missing env: %s. "
+        "dialogue-handoff v3.1: plugin DISABLED — missing env: %s. "
         "The plugin will not read or write any handoff/always-context file. "
-        "Set the above vars in the agent's .env (see hermes-memory-kit v3.0 docs).",
+        "Set the above vars in the agent's .env (see hermes-memory-kit v3 docs).",
         ", ".join(missing),
     )
 
@@ -131,7 +134,6 @@ def _extract_working_set(history: List[Dict[str, Any]]) -> List[str]:
                 args = json.loads(fn.get("arguments") or "{}")
             except Exception:
                 args = {}
-
             if name in _FILE_TOOLS_WITH_PATH:
                 for k in ("path", "file_path", "target_path"):
                     v = args.get(k)
@@ -172,84 +174,43 @@ def _resume_hint(response: str) -> str:
     return sent[:120].strip()
 
 
-def _first_line(s: str, cap: int = 300) -> str:
+# v3.1: _trunc preserves multi-line.
+def _trunc(s: str, n: int) -> str:
     if not s:
         return ""
-    return s.strip().splitlines()[0][:cap]
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1].rstrip() + "…"
 
 
-def _on_post_llm_call(
-    session_id: str = "",
-    user_message: str = "",
-    assistant_response: str = "",
-    conversation_history: List[Dict[str, Any]] = None,
-    model: str = "",
-    platform: str = "",
-    **_ignored: Any,
-) -> None:
-    if not _CONFIG_OK or _HANDOFF_PATH is None:
-        return
-    try:
-        um = (user_message or "").strip()
-        if not um or um.startswith("/") or len(um) < 3:
-            return
-
-        working_set = _extract_working_set(conversation_history or [])
-        session_path = _resolve_session_path(session_id)
-        hint = _resume_hint(assistant_response)
-        now = datetime.datetime.now().isoformat(timespec="seconds")
-
-        lines = [
-            "# DIALOGUE-HANDOFF",
-            "",
-            "## Last Turn",
-            f"- platform: {platform or 'cli'}",
-            f"- session_id: {session_id}",
-            f"- timestamp: {now}",
-            f"- model: {model}",
-            "",
-            "## Session Path",
-            f"- {session_path or 'none'}",
-            "",
-            "## Last User Message",
-            f"- {_first_line(um)}",
-            "",
-            "## Last Assistant Response",
-            f"- {_first_line(assistant_response)}",
-            "",
-            "## Last Working Set",
-        ]
-        if working_set:
-            for p in working_set:
-                lines.append(f"- {p}")
-        else:
-            lines.append("- none")
-        lines += ["", "## Resume Hint", f"- {hint}", ""]
-
-        _HANDOFF_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _HANDOFF_PATH.write_text("\n".join(lines), encoding="utf-8")
-        try:
-            os.chmod(_HANDOFF_PATH, 0o600)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.warning("dialogue-handoff post_llm_call failed: %s", e)
+# v3.1: substantive gate.
+_SUBSTANTIVE_MIN_CHARS = 300
 
 
-# --- read side (pre_llm_call) ----------------------------------------
+def _is_substantive(user_msg: str, assistant_resp: str) -> bool:
+    """A turn is substantive if user+assistant combined content meets the threshold."""
+    return len((user_msg or "").strip()) + len((assistant_resp or "").strip()) >= _SUBSTANTIVE_MIN_CHARS
 
-_STALE_HOURS = 24
+
+# v3.1: recent-exchanges persistence.
+_TAIL_EXCHANGES = 4  # how many recent substantive exchanges to persist in handoff
+_TAIL_CHARS_PER_MSG = 2000  # per-message cap inside tail (user or assistant)
+
+# Legacy tier constants (used ONLY if reading a v3.0 handoff without Recent Exchanges block).
 _BUDGET_CHARS = 6000
 _TIER1_CHARS = 300
 _TIER2_CHARS = 150
 _TIER3_CHARS = 80
 _TIER3_STRIDE = 3
+_STALE_HOURS = 24
 
+# ALWAYS-CONTEXT layer (v2.1).
 _ALWAYS_CONTEXT_BUDGET = 1500
 
 
 def _load_always_context() -> str:
-    if not _CONFIG_OK or _ALWAYS_CONTEXT_PATH is None:
+    if not _ALWAYS_CONTEXT_PATH:
         return ""
     try:
         if not _ALWAYS_CONTEXT_PATH.exists():
@@ -265,17 +226,187 @@ def _load_always_context() -> str:
         return ""
 
 
-def _parse_bullets(lines: List[str]) -> List[str]:
-    out = []
+def _first_line(s: str, cap: int = 300) -> str:
+    if not s:
+        return ""
+    return s.strip().splitlines()[0][:cap]
+
+
+# --- parsers -----------------------------------------------------------
+
+
+def _parse_recent_exchanges(text: str) -> List[Dict[str, str]]:
+    """Parse `## Recent Exchanges` block. Returns newest-first list of
+    {header, user, assistant}.
+    """
+    lines = text.splitlines()
+    in_section = False
+    current: Optional[Dict[str, str]] = None
+    exchanges: List[Dict[str, str]] = []
+    role: Optional[str] = None
     for ln in lines:
-        s = ln.strip()
-        if not s:
+        if ln.startswith("## Recent Exchanges"):
+            in_section = True
             continue
-        if s.startswith("- "):
-            s = s[2:].strip()
-        if s:
-            out.append(s)
-    return out
+        if not in_section:
+            continue
+        # Next top-level section ends our block
+        if ln.startswith("## ") and not ln.startswith("## Recent Exchanges"):
+            break
+        if ln.startswith("### "):
+            if current is not None:
+                exchanges.append(current)
+            current = {"header": ln[4:].strip(), "user": "", "assistant": ""}
+            role = None
+            continue
+        if current is None:
+            continue
+        if ln.startswith("USER:"):
+            role = "user"
+            current["user"] = ln[5:].lstrip()
+            continue
+        if ln.startswith("HERMES:") or ln.startswith("ASSISTANT:"):
+            role = "assistant"
+            _, _, rest = ln.partition(":")
+            current["assistant"] = rest.lstrip()
+            continue
+        if role == "user":
+            current["user"] += "\n" + ln
+        elif role == "assistant":
+            current["assistant"] += "\n" + ln
+    if current is not None:
+        exchanges.append(current)
+    for ex in exchanges:
+        ex["user"] = ex["user"].strip()
+        ex["assistant"] = ex["assistant"].strip()
+    return exchanges
+
+
+def _format_recent_exchanges_block(exchanges: List[Dict[str, str]]) -> str:
+    """Serialize tail list into the markdown block.
+
+    exchanges: newest-first. Output numbering: newest = N, oldest = 1.
+    """
+    lines = [
+        "## Recent Exchanges",
+        "<!-- Verbatim multi-line tail of the last substantive turns. "
+        "Read directly by pre_llm_call; do not require reopening session JSON. -->",
+        "",
+    ]
+    n = len(exchanges)
+    for i, ex in enumerate(exchanges):
+        idx = n - i  # exchanges[0] is newest → N
+        header = ex.get("header") or f"Exchange {idx}"
+        u = _trunc(ex.get("user", ""), _TAIL_CHARS_PER_MSG)
+        a = _trunc(ex.get("assistant", ""), _TAIL_CHARS_PER_MSG)
+        lines.append(f"### {header}")
+        if u:
+            lines.append(f"USER: {u}")
+        if a:
+            lines.append(f"HERMES: {a}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _read_existing_tail() -> List[Dict[str, str]]:
+    if not _HANDOFF_PATH or not _HANDOFF_PATH.exists():
+        return []
+    try:
+        text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
+        return _parse_recent_exchanges(text)
+    except Exception as exc:
+        logger.warning("dialogue-handoff: could not parse existing tail: %s", exc)
+        return []
+
+
+def _on_post_llm_call(
+    session_id: str = "",
+    user_message: str = "",
+    assistant_response: str = "",
+    conversation_history: List[Dict[str, Any]] = None,
+    model: str = "",
+    platform: str = "",
+    **_ignored: Any,
+) -> None:
+    if not _CONFIG_OK:
+        return
+    try:
+        um = (user_message or "").strip()
+        ar = (assistant_response or "").strip()
+        # Basic sanity: skip command-only turns (/reset, /model, etc.) and very empty
+        if not um or um.startswith("/") or len(um) < 3:
+            return
+
+        working_set = _extract_working_set(conversation_history or [])
+        session_path = _resolve_session_path(session_id)
+        hint = _resume_hint(ar)
+        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+
+        # v3.1: decide if this turn is substantive.
+        sustantivo = _is_substantive(um, ar)
+
+        # Build/update the Recent Exchanges tail.
+        tail = _read_existing_tail()
+        if sustantivo:
+            new_entry = {
+                "header": f"Exchange @ {now_iso} ({platform or 'cli'}, session {session_id or '?'})",
+                "user": um,
+                "assistant": ar,
+            }
+            tail = [new_entry] + tail
+            tail = tail[:_TAIL_EXCHANGES]
+        # else: keep tail unchanged (trivial echoes don't overwrite a good tail)
+
+        # Compose the full handoff doc.
+        lines = [
+            "# DIALOGUE-HANDOFF",
+            "",
+            "## Last Turn",
+            f"- platform: {platform or 'cli'}",
+            f"- session_id: {session_id}",
+            f"- timestamp: {now_iso}",
+            f"- model: {model}",
+            f"- substantive: {str(sustantivo).lower()}",
+            "",
+            "## Session Path",
+            f"- {session_path or 'none'}",
+            "",
+            "## Last User Message (headline)",
+            f"- {_first_line(um)}",
+            "",
+            "## Last Assistant Response (headline)",
+            f"- {_first_line(ar)}",
+            "",
+            "## Last Working Set",
+        ]
+        if working_set:
+            for p in working_set:
+                lines.append(f"- {p}")
+        else:
+            lines.append("- none")
+        lines += ["", "## Resume Hint", f"- {hint}", ""]
+
+        # Append the Recent Exchanges tail block (or explicit empty marker).
+        if tail:
+            lines.append(_format_recent_exchanges_block(tail))
+        else:
+            lines += [
+                "## Recent Exchanges",
+                "<!-- empty: no substantive turn recorded yet -->",
+                "",
+            ]
+
+        _HANDOFF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _HANDOFF_PATH.write_text("\n".join(lines), encoding="utf-8")
+        try:
+            os.chmod(_HANDOFF_PATH, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("dialogue-handoff post_llm_call failed: %s", e)
+
+
+# --- read side (pre_llm_call) ----------------------------------------
 
 
 def _parse_handoff_md(text: str) -> Dict[str, Any]:
@@ -283,39 +414,47 @@ def _parse_handoff_md(text: str) -> Dict[str, Any]:
     current = None
     buf: List[str] = []
     for ln in text.splitlines():
-        if ln.startswith("## "):
+        if ln.startswith("## ") and not ln.startswith("## Recent Exchanges"):
             if current:
                 sections[current] = buf
             current = ln[3:].strip()
             buf = []
-        elif current is not None:
+        elif current is not None and not ln.startswith("## Recent Exchanges"):
             buf.append(ln)
+        elif ln.startswith("## Recent Exchanges"):
+            # stop parsing "header" sections at the tail block
+            if current:
+                sections[current] = buf
+            current = None
     if current:
         sections[current] = buf
 
+    def parse_bullets(block):
+        out = []
+        for raw in block:
+            s = raw.strip()
+            if s.startswith("- "):
+                out.append(s[2:].strip())
+        return out
+
     out: Dict[str, Any] = {}
-    for bullet in _parse_bullets(sections.get("Last Turn", [])):
+    for bullet in parse_bullets(sections.get("Last Turn", [])):
         if ":" in bullet:
             k, _, v = bullet.partition(":")
             out[k.strip().lower().replace(" ", "_")] = v.strip()
 
-    sp = _parse_bullets(sections.get("Session Path", []))
+    sp = parse_bullets(sections.get("Session Path", []))
     out["session_path"] = sp[0] if sp and sp[0] != "none" else ""
 
-    lum = _parse_bullets(sections.get("Last User Message", []))
+    lum = parse_bullets(sections.get("Last User Message (headline)", []) or sections.get("Last User Message", []))
     out["last_user_message"] = lum[0] if lum else ""
 
-    lar = _parse_bullets(sections.get("Last Assistant Response", []))
+    lar = parse_bullets(sections.get("Last Assistant Response (headline)", []) or sections.get("Last Assistant Response", []))
     out["last_assistant_response"] = lar[0] if lar else ""
 
-    out["last_working_set"] = [
-        p for p in _parse_bullets(sections.get("Last Working Set", []))
-        if p and p != "none"
-    ]
-
-    rh = _parse_bullets(sections.get("Resume Hint", []))
+    out["last_working_set"] = [p for p in parse_bullets(sections.get("Last Working Set", [])) if p and p != "none"]
+    rh = parse_bullets(sections.get("Resume Hint", []))
     out["resume_hint"] = rh[0] if rh else ""
-
     return out
 
 
@@ -409,19 +548,50 @@ def _group_exchanges(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return exchanges
 
 
-def _trunc(s: str, n: int) -> str:
-    if not s:
-        return ""
-    s = s.strip().splitlines()[0] if "\n" in s else s.strip()
-    if len(s) <= n:
-        return s
-    return s[:n - 1].rstrip() + "…"
-
-
-def _build_injection(handoff: Dict[str, Any], exchanges: List[Dict[str, str]], budget: int = _BUDGET_CHARS) -> str:
+def _build_injection_from_tail(handoff: Dict[str, Any], tail: List[Dict[str, str]]) -> str:
+    """v3.1 injection: take the pre-packed `## Recent Exchanges` tail directly.
+    Multi-line preserved up to _TAIL_CHARS_PER_MSG per message.
+    """
     lines: List[str] = []
     lines.append("<previous_session_context>")
     lines.append("<!-- auto-injected continuity from previous session; absorb naturally, do not quote metadata -->")
+    lines.append("")
+    ts = handoff.get("timestamp", "?")
+    platform = handoff.get("platform", "?")
+    lines.append(f"Previous session: {ts} ({platform})")
+    ws = handoff.get("last_working_set") or []
+    if ws:
+        lines.append(f"Files touched: {', '.join(ws[:5])}")
+    if handoff.get("resume_hint"):
+        lines.append(f"Resume hint: {handoff['resume_hint']}")
+    lines.append("")
+    lines.append("### Recent exchanges (newest at the bottom, multi-line preserved):")
+    lines.append("")
+    # Emit oldest→newest (reverse of newest-first tail) so newest sits at the end
+    for ex in reversed(tail):
+        header = ex.get("header", "")
+        u = _trunc(ex.get("user", ""), _TAIL_CHARS_PER_MSG)
+        a = _trunc(ex.get("assistant", ""), _TAIL_CHARS_PER_MSG)
+        if header:
+            lines.append(f"#### {header}")
+        if u:
+            lines.append(f"USER: {u}")
+        if a:
+            lines.append(f"HERMES: {a}")
+        lines.append("")
+    lines.append("</previous_session_context>")
+    return "\n".join(lines)
+
+
+def _build_injection_legacy_tiered(handoff: Dict[str, Any], exchanges: List[Dict[str, str]], budget: int = _BUDGET_CHARS) -> str:
+    """Legacy v3.0 injection — reads session JSON and emits 3-tier compressed block.
+
+    Used only if the handoff has no Recent Exchanges block yet (v3.0 → v3.1 transition)
+    OR as a fallback if the tail is empty.
+    """
+    lines: List[str] = []
+    lines.append("<previous_session_context>")
+    lines.append("<!-- auto-injected continuity (legacy tiered mode — handoff lacks Recent Exchanges) -->")
     lines.append("")
     ts = handoff.get("timestamp", "?")
     platform = handoff.get("platform", "?")
@@ -471,7 +641,6 @@ def _build_injection(handoff: Dict[str, Any], exchanges: List[Dict[str, str]], b
 
     lines.append("</previous_session_context>")
     out = "\n".join(lines)
-
     if len(out) > budget:
         cutoff = budget - len("\n[truncated]\n</previous_session_context>")
         out = out[:cutoff].rstrip() + "\n[truncated]\n</previous_session_context>"
@@ -494,22 +663,28 @@ def _on_pre_llm_call(
         if um.startswith("/"):
             return None
 
+        # Layer 1 (v2.1): always-context
         always_block = _load_always_context()
 
+        # Layer 2: dialogue handoff (v3.1 tail-first, v3.0 JSON fallback)
         handoff_block = ""
         try:
-            if _HANDOFF_PATH is not None and _HANDOFF_PATH.exists():
+            if _HANDOFF_PATH and _HANDOFF_PATH.exists():
                 text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
                 handoff = _parse_handoff_md(text)
-                if (handoff.get("last_user_message")
-                        and handoff.get("last_user_message") != "none"
-                        and not _is_stale(handoff)):
-                    session_path = handoff.get("session_path", "")
-                    exchanges: List[Dict[str, str]] = []
-                    if session_path:
-                        messages = _load_session_messages(session_path)
-                        exchanges = _group_exchanges(messages)
-                    handoff_block = _build_injection(handoff, exchanges)
+                if handoff.get("last_user_message") and handoff["last_user_message"] != "none" and not _is_stale(handoff):
+                    # Try v3.1 path: parsed tail from handoff itself (no JSON)
+                    tail = _parse_recent_exchanges(text)
+                    if tail:
+                        handoff_block = _build_injection_from_tail(handoff, tail)
+                    else:
+                        # Legacy fallback: reopen session JSON + tiered build
+                        session_path = handoff.get("session_path", "")
+                        if session_path:
+                            messages = _load_session_messages(session_path)
+                            exchanges = _group_exchanges(messages)
+                            if exchanges:
+                                handoff_block = _build_injection_legacy_tiered(handoff, exchanges)
         except Exception as exc:
             logger.warning("dialogue-handoff: handoff build failed: %s", exc)
 

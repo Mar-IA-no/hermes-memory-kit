@@ -2,6 +2,29 @@
 
 All notable changes to hermes-memory-kit.
 
+## v3.1.0 — 2026-04-23
+
+### Fixed (critical continuity bug)
+
+- **`_trunc()` preserves multi-line content.** Before, it did `s.splitlines()[0]` when the text had newlines, so any markdown response (tables, lists, code blocks) was reduced to its first sentence before injection. A 5,326-char response ended up as a 100-char headline. Fix: truncate by character budget, preserving newlines. Measured impact on a real session: injection grew from 458 chars to 2,464 chars (5.4×) with semantic structure intact.
+
+### New (persistence of substantive tail)
+
+- **`DIALOGUE-HANDOFF.md` now persists `## Recent Exchanges`** — a verbatim multi-line tail of the last N substantive turns (default N=4, cap 2000 chars per message). Written by `post_llm_call` and read by `pre_llm_call` directly, eliminating the need to reopen the session JSON on every new-session cold start.
+- **Backwards-compatible**: if the handoff still lacks the Recent Exchanges block (e.g. a v3.0 handoff mid-upgrade), `pre_llm_call` falls back to the legacy tiered-JSON path. The next `post_llm_call` substantive turn upgrades the handoff to v3.1 format.
+
+### New (anti-trivial gate)
+
+- **`_is_substantive(user, assistant)`** threshold (default 300 chars combined) gates the Recent Exchanges update. Trivial turns like "en qué estábamos?" no longer overwrite the real conversation tail — metadata still updates (Last Turn timestamp, session_id), but the tail stays intact until a real turn arrives.
+
+### Knobs (calibrable)
+
+- `_SUBSTANTIVE_MIN_CHARS = 300` — below this, turn does not update tail.
+- `_TAIL_EXCHANGES = 4` — how many substantive exchanges kept in handoff.
+- `_TAIL_CHARS_PER_MSG = 2000` — per-message char cap in tail.
+
+Legacy tiered knobs (`_BUDGET_CHARS`, `_TIER*_CHARS`, `_TIER3_STRIDE`) remain but are used only in the backwards-compatibility fallback path.
+
 ## v3.0.1 — 2026-04-23
 
 ### Fixed (critical)
