@@ -33,7 +33,9 @@ echo "[7] plugins + DIALOGUE-HANDOFF template + continuityctl present"
 test -f "$TMP/ws/plugins/dialogue-handoff/__init__.py" || { echo "FAIL: plugin __init__.py missing"; exit 1; }
 test -f "$TMP/ws/plugins/dialogue-handoff/plugin.yaml" || { echo "FAIL: plugin.yaml missing"; exit 1; }
 test -f "$TMP/ws/agent-memory/state/DIALOGUE-HANDOFF.md" || { echo "FAIL: handoff template missing"; exit 1; }
+test -f "$TMP/ws/agent-memory/state/ALWAYS-CONTEXT.md" || { echo "FAIL: always-context template missing (v2.1)"; exit 1; }
 test -f "$TMP/ws/scripts/continuityctl.py" || { echo "FAIL: continuityctl missing"; exit 1; }
+grep -q "version: 2.1.0" "$TMP/ws/plugins/dialogue-handoff/plugin.yaml" || { echo "FAIL: plugin not v2.1.0"; exit 1; }
 
 echo "[8] continuityctl syntax OK + rehydrate runs (even with placeholder state)"
 python3 -m py_compile "$TMP/ws/scripts/continuityctl.py"

@@ -1,5 +1,5 @@
 name: dialogue-handoff
-version: 2.0.0
+version: 2.1.0
 description: "Conversational continuity for Hermes. Writes DIALOGUE-HANDOFF.md on each non-trivial turn (post_llm_call), and auto-injects tiered-compressed continuity context on the first turn of every new session (pre_llm_call). Separates real user<->Hermes dialogue from meta-engineering state in ACTIVE-CONTEXT.md."
 author: "local (onairam)"
 provides_hooks:

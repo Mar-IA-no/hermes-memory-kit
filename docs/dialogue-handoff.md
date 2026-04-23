@@ -156,3 +156,80 @@ Useful as a reorientation primitive for any agent on top of the kit, not just He
 ## Architecture notes
 
 The design decision to inject at the USER MESSAGE (not the system prompt) is intentional: it preserves the prompt cache prefix that most providers (Anthropic, OpenAI) charge less for on cache hits. The injection is ephemeral — it never gets persisted to the session DB, so subsequent turns of the same session won't see it replayed. See `Hermes run_agent.py:8858` for the implementation of the hook invocation.
+
+## The ALWAYS-CONTEXT layer (v2.1)
+
+Complementary to the volatile DIALOGUE-HANDOFF, the plugin also reads a **persistent, user-editable file** called `ALWAYS-CONTEXT.md` and prepends its contents to the injection on every `is_first_turn`.
+
+### Why it exists
+
+The dialogue handoff is about "what just happened." But the agent also needs stable reminders about **what capabilities it has and how to use them**, reinforced at every session start. Without this, models default to habitual behaviors (e.g., running `grep` in filesystem) instead of using the kit's memory library — even when `AGENTS.md` mentions the library in the system prompt. Position bias towards the user message end makes this injection more effective than system-prompt reminders alone.
+
+### Location
+
+- Default: `agent-memory/state/ALWAYS-CONTEXT.md` in the workspace.
+- Override: set `HMK_ALWAYS_CONTEXT_PATH` env var.
+
+### Content guidelines
+
+- **Short and imperative** — "Use X BEFORE grep" beats "X is available".
+- **Cap at 1000 chars** — the plugin truncates beyond that to protect the turn budget.
+- **Stable facts only** — commands that work, rules that apply. No user-specific facts (those go in `USER.md`), no conversation history (that's the handoff).
+- **Edit freely per workspace** — different workspaces may have different capability surfaces.
+
+### How it combines with the handoff
+
+Injection order in the user message:
+
+```
+<always_context>
+... capabilities + rules ...
+</always_context>
+
+<previous_session_context>
+... tiered-compressed last conversation ...
+</previous_session_context>
+
+[original user message]
+```
+
+ALWAYS-CONTEXT goes first; the handoff goes last for recency bias. If handoff is missing, stale, or empty, only ALWAYS-CONTEXT is injected. If both are missing, the plugin returns nothing (no-op).
+
+### Template (ships with the kit)
+
+```markdown
+# Always-context
+
+## Memoria durable (usar ANTES de grep/find en filesystem)
+- `./scripts/hmk memoryctl.py hybrid-pack --query "..." --limit 4 --threshold 0.4`
+- `./scripts/hmk memoryctl.py search --query "..." --limit 5`
+- `./scripts/hmk memoryctl.py expand --id N`
+
+**Regla**: ante cualquier pregunta sobre conocimiento del workspace,
+probar la library PRIMERO. Si da `null_retrieval`, recién ahí buscar en disco.
+
+## Skill de curación
+`skill_view librarian` describe convenciones completas.
+
+## Re-hidratación táctica
+`./scripts/hmk continuityctl.py rehydrate` devuelve identity + meta_context +
+dialogue_handoff + memorias exactas en un JSON.
+
+## Wiki
+`wiki/` es proyección desde el canon. OK leerla para orientación;
+NO citarla como evidencia — siempre volver a `library.db`.
+```
+
+### Relationship to other files
+
+| File | Layer | Scope | Updated by |
+|---|---|---|---|
+| `SOUL.md` (Hermes) | system prompt | agent identity | operator, rarely |
+| `USER.md` (Hermes) | system prompt | who the user is | operator, rarely |
+| `AGENTS.md` (workspace) | system prompt | general behavior rules | operator, occasionally |
+| `ALWAYS-CONTEXT.md` (workspace) | **user msg (v2.1)** | capability reminders | user, per workspace |
+| `DIALOGUE-HANDOFF.md` | user msg (v2.0) | last conversation | plugin, per turn |
+| `ACTIVE-CONTEXT.md` | read on demand | engineering meta-state | operator (Codex-style) |
+
+The distinction from `AGENTS.md`: AGENTS.md gets loaded into the system prompt ONCE at session init (and cached). Kimi and other models sometimes drown its guidance in the rest of the system prompt. ALWAYS-CONTEXT is injected into the user message — position-biased towards recency — which gives the capability reminder much stronger weight per turn.
+

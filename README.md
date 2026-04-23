@@ -145,7 +145,9 @@ El kit trae un plugin para Hermes Agent que resuelve un problema concreto:
 
 > **"Abro Hermes, digo 'continua', y me pregunta de qué estábamos hablando."**
 
-El plugin `dialogue-handoff` elimina ese roce. Escribe un archivo con el último turno después de cada interacción (`post_llm_call`), y lo inyecta automáticamente al primer turno de toda sesión nueva (`pre_llm_call`). Estrategia de compresión:
+El plugin `dialogue-handoff` (v2.1) elimina ese roce con **dos capas**:
+
+- **Capa volátil** (`DIALOGUE-HANDOFF.md`) — el último turno + arco reciente, escrito después de cada interacción vía `post_llm_call`. Tiered-compressed:
 
 | Tier | Scope | Verbosidad |
 |---|---|---|
@@ -154,7 +156,9 @@ El plugin `dialogue-handoff` elimina ese roce. Escribe un archivo con el último
 | 3 | exchanges 7-20 | stride 1-de-3, 80 chars/msg |
 | 4 | > 20 | descartado |
 
-Budget total: 6000 chars. Position-aware (los más recientes al final para vencer "lost-in-the-middle").
+Budget: 6000 chars. Position-aware (los más recientes al final para vencer "lost-in-the-middle").
+
+- **Capa persistente** (`ALWAYS-CONTEXT.md`) — reminders imperativos sobre capacidades del workspace ("usá memoryctl ANTES de grep"). User-editable, budget 1000 chars, siempre se inyecta si existe — incluso cuando el handoff está vacío o stale. Resuelve el problema común de que el modelo "se olvida" que tiene el sistema de memoria disponible.
 
 **Gates** para no molestar: no inyecta en turnos subsiguientes, ni en comandos `/`, ni si el handoff tiene más de 24h.
 
@@ -289,7 +293,7 @@ Ver [docs/install.md](docs/install.md) para el flujo completo, [docs/providers.m
 | ingest_any | 🟡 funciona, deps (`mammoth`, `markdownify`, `trafilatura`) deben estar instalados |
 | export_obsidian | ✅ estable |
 | continuityctl | ✅ portado del sistema live, estable |
-| dialogue-handoff plugin | ✅ v2.0, testeado manual con Hermes v0.10.0 |
+| dialogue-handoff plugin | ✅ v2.1 (always-context + handoff layers), testeado manual con Hermes v0.10.0 |
 | CI / pyproject.toml | ⏳ pendiente — por ahora solo smoke test local |
 
 Este repo es una extracción portable del sistema construido en una notebook real de experimentación. Ya está desacoplado de rutas fijas gruesas y cuenta con smoke test. Sigue en fase de hardening; issues y PRs bienvenidos.

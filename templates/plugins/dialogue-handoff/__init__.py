@@ -1,4 +1,15 @@
-"""dialogue-handoff plugin v2.0 — conversational continuity for Hermes.
+"""dialogue-handoff plugin v2.1 — conversational continuity for Hermes.
+
+v2.0 → v2.1:
+  - NEW: always_context layer. Reads ALWAYS-CONTEXT.md (user-editable,
+    workspace-local) and prepends its content to the injection on
+    is_first_turn. Injected even if the handoff is missing or stale —
+    purpose is to keep imperative capability reminders (e.g. "use
+    memoryctl before grep") always fresh at session start.
+  - The handoff layer is now OPTIONAL. If it fails (missing, stale,
+    empty), the plugin still injects the always_context if present.
+  - Separate budget: ALWAYS-CONTEXT capped at 1000 chars; handoff stays
+    at 6000. Total injection ≤ ~7000 chars / ~1750 tokens.
 
 v1.1 → v2.0:
   - NEW: pre_llm_call hook. On the first turn of every new session, reads
@@ -44,6 +55,10 @@ _AGENT_MEMORY_BASE = _resolve_path(
 _HANDOFF_PATH = _resolve_path(
     ["HMK_DIALOGUE_HANDOFF_PATH"],
     str(_AGENT_MEMORY_BASE / "state" / "DIALOGUE-HANDOFF.md"),
+)
+_ALWAYS_CONTEXT_PATH = _resolve_path(
+    ["HMK_ALWAYS_CONTEXT_PATH"],
+    str(_AGENT_MEMORY_BASE / "state" / "ALWAYS-CONTEXT.md"),
 )
 
 _HERMES_HOME = _resolve_path(
@@ -213,6 +228,26 @@ _TIER1_CHARS = 300
 _TIER2_CHARS = 150
 _TIER3_CHARS = 80
 _TIER3_STRIDE = 3
+
+# ALWAYS-CONTEXT layer (v2.1): user-editable imperative reminders that get
+# injected into every is_first_turn, even when handoff is missing/stale.
+_ALWAYS_CONTEXT_BUDGET = 1000
+
+
+def _load_always_context() -> str:
+    """Return ALWAYS-CONTEXT.md content (capped), or "" if missing/unreadable."""
+    try:
+        if not _ALWAYS_CONTEXT_PATH.exists():
+            return ""
+        text = _ALWAYS_CONTEXT_PATH.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            return ""
+        if len(text) > _ALWAYS_CONTEXT_BUDGET:
+            text = text[:_ALWAYS_CONTEXT_BUDGET].rstrip() + "\n[truncated]"
+        return text
+    except Exception as exc:
+        logger.warning("dialogue-handoff: could not read ALWAYS-CONTEXT: %s", exc)
+        return ""
 
 
 def _parse_bullets(lines: List[str]) -> List[str]:
@@ -451,35 +486,50 @@ def _on_pre_llm_call(
         um = (user_message or "").strip()
         if um.startswith("/"):
             return None
-        # Gate 3: handoff file must exist
-        if not _HANDOFF_PATH.exists():
-            return None
+
+        # Layer 1 (v2.1): always-context — imperative reminders that must
+        # survive even when the handoff layer has nothing useful. Injected
+        # first so handoff (more recent) sits at the end for recency bias.
+        always_block = _load_always_context()
+
+        # Layer 2: dialogue handoff — tiered-compressed arc of the last
+        # conversation. Optional: failure here does not abort injection.
+        handoff_block = ""
         try:
-            text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
-        except Exception:
+            if _HANDOFF_PATH.exists():
+                text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
+                handoff = _parse_handoff_md(text)
+                # Only build handoff if it has real content + is fresh
+                if (handoff.get("last_user_message")
+                        and handoff.get("last_user_message") != "none"
+                        and not _is_stale(handoff)):
+                    session_path = handoff.get("session_path", "")
+                    exchanges: List[Dict[str, str]] = []
+                    if session_path:
+                        messages = _load_session_messages(session_path)
+                        exchanges = _group_exchanges(messages)
+                    handoff_block = _build_injection(handoff, exchanges)
+        except Exception as exc:
+            logger.warning("dialogue-handoff: handoff build failed: %s", exc)
+
+        # Nothing to inject? return None (no-op for the hook)
+        if not always_block and not handoff_block:
             return None
-        handoff = _parse_handoff_md(text)
-        # Gate 4: must have minimum content (not just the initial template)
-        if not handoff.get("last_user_message") or handoff.get("last_user_message") == "none":
-            return None
-        # Gate 5: not stale
-        if _is_stale(handoff):
-            return None
-        # Load session messages if path valid, apply tiered compression
-        exchanges: List[Dict[str, str]] = []
-        session_path = handoff.get("session_path", "")
-        if session_path:
-            messages = _load_session_messages(session_path)
-            exchanges = _group_exchanges(messages)
-            # Drop the very last exchange if its user message matches
-            # handoff.last_user_message (already summarized in handoff header)
-            # and add at least the last 2 exchanges. Don't drop if it would
-            # leave us with nothing.
-            pass
-        block = _build_injection(handoff, exchanges)
-        return {"context": block}
-    except Exception as e:
-        logger.warning("dialogue-handoff pre_llm_call failed: %s", e)
+
+        parts: List[str] = []
+        if always_block:
+            parts.append(
+                "<always_context>\n"
+                "<!-- stable capabilities + rules; absorb as working knowledge -->\n"
+                + always_block
+                + "\n</always_context>"
+            )
+        if handoff_block:
+            parts.append(handoff_block)
+
+        return {"context": "\n\n".join(parts)}
+    except Exception as exc:
+        logger.warning("dialogue-handoff pre_llm_call failed: %s", exc)
         return None
 
 
