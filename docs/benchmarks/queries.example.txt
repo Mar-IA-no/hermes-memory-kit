@@ -1,0 +1,34 @@
+# Embedding benchmark query set — example template
+#
+# FORMAT:
+#   <query text>               (no annotation; retrieval scored only on auto metrics)
+#   <query text> | expected:   (negative control — should return null_retrieval)
+#   <query text> | expected: 17,42,88   (expected relevant chapter IDs for Precision@k / Recall@k)
+#
+# Lines starting with # are comments.
+#
+# BEST PRACTICE:
+# - Include a mix of precise queries (specific nouns or proper nouns) and
+#   broad topical queries. Annotate `expected:` for the ones you know the
+#   ground truth on — those drive the strongest verdict signal.
+# - Include 1-2 negative controls (unrelated topics) to detect false-positive
+#   retrieval differences between providers.
+# - Keep the query set small (8-15 queries is plenty). More queries =
+#   better stats but longer runs and higher API cost.
+# - DO NOT put sensitive corpus content in query text if you plan to share
+#   the queries file publicly. Keep your real queries in a local file
+#   outside any repo (e.g. ~/hmk-benchmarks/queries.txt).
+
+# --- example queries (REPLACE with yours against your actual corpus) ---
+introduction to your main research topic
+key authors cited across the corpus
+project roadmap and milestones | expected:
+the most recent technical decision in your project
+
+# --- example expected-annotated query ---
+# pretend you know chapter IDs 17 and 42 cover this topic:
+neural network architecture for image classification | expected: 17,42
+
+# --- negative controls (should return null_retrieval on both sides) ---
+recetas de cocina italiana | expected:
+world cup final 1998 | expected:
