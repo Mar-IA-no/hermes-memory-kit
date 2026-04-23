@@ -231,7 +231,7 @@ _TIER3_STRIDE = 3
 
 # ALWAYS-CONTEXT layer (v2.1): user-editable imperative reminders that get
 # injected into every is_first_turn, even when handoff is missing/stale.
-_ALWAYS_CONTEXT_BUDGET = 1000
+_ALWAYS_CONTEXT_BUDGET = 1500
 
 
 def _load_always_context() -> str:
