@@ -107,7 +107,7 @@ Si corrés Hermes Agent, el paso siguiente es activar `plugins/dialogue-handoff/
 ## Arquitectura
 
 <p align="center">
-  <img src="docs/assets/architecture.svg" alt="Arquitectura de Hermes Memory Kit: workspace autocontenido, canon durable en library.db, continuidad reinyectable con dialogue-handoff y capa proyectada wiki." width="980">
+  <img src="docs/assets/architecture.png" alt="Arquitectura de Hermes Memory Kit: workspace autocontenido, canon durable en library.db, continuidad reinyectable con dialogue-handoff y capa proyectada wiki." width="980">
 </p>
 
 **Tres capas que juntas forman la memoria operativa**:
