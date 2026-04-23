@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -42,8 +45,54 @@ def run_capture(cmd):
     return proc.stdout
 
 
-def convert_pdf(path: Path) -> str:
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def text_looks_useful(text: str) -> bool:
+    stripped = text.strip()
+    if len(stripped) < 80:
+        return False
+    alpha = sum(1 for ch in stripped if ch.isalpha())
+    return alpha >= 40
+
+
+def convert_pdf_native(path: Path) -> str:
     return run_capture(["pdftotext", "-layout", "-nopgbrk", str(path), "-"])
+
+
+def convert_pdf_via_ocr(path: Path) -> str:
+    if not command_exists("ocrmypdf"):
+        raise SystemExit(
+            "pdf conversion produced empty markdown and OCR fallback is unavailable "
+            "(install ocrmypdf + tesseract)"
+        )
+    languages = os.environ.get("HMK_OCR_LANGS", "eng")
+    with tempfile.TemporaryDirectory(prefix="hmk-ocr-") as tmpdir:
+        ocr_pdf = Path(tmpdir) / "ocr-output.pdf"
+        cmd = [
+            "ocrmypdf",
+            "--force-ocr",
+            "--rotate-pages",
+            "--deskew",
+            "--output-type",
+            "pdf",
+            "-l",
+            languages,
+            str(path),
+            str(ocr_pdf),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            raise SystemExit(proc.stderr.strip() or f"command failed: {' '.join(cmd)}")
+        return convert_pdf_native(ocr_pdf)
+
+
+def convert_pdf(path: Path) -> str:
+    text = convert_pdf_native(path)
+    if text_looks_useful(text):
+        return text
+    return convert_pdf_via_ocr(path)
 
 
 def extract_html_to_markdown(text: str) -> str:
