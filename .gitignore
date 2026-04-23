@@ -8,3 +8,7 @@ agent-memory/*.db
 agent-memory/*.sqlite
 wiki/.projection-manifest.json
 wiki/.obsidian/
+
+# local backup files (never commit)
+*.bak
+*.bak.*
