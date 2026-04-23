@@ -135,7 +135,6 @@ Eso es todo. La DB vive en `~/mi-workspace/agent-memory/library.db` y podés usa
 - `library.db` → **canon** (fuente de verdad, FTS5 + embeddings, precisa)
 - `wiki/` → **proyección** (navegación humana tipo Obsidian, generada desde el canon)
 
-Regla: canon primero, proyección después. Nunca ingestar datos desde el wiki — siempre desde fuentes originales.
 
 ---
 
@@ -324,7 +323,7 @@ No hay CI todavía — el smoke test local es la barrera.
 
 ## Licencia
 
-[MIT](LICENSE) © 2026 Mariano Fernández Méndez / Mar-IA-no.
+[MIT](LICENSE)
 
 ---
 
