@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Bootstrap or upgrade a self-contained Hermes agent workspace.
+
+A workspace is a single directory that contains everything an agent needs:
+
+  <agent_dir>/
+    AGENTS.md                     operator-facing notes for this agent
+    .env                          all HMK_* paths + API keys + platform tokens
+    hermes-home/                  HERMES_HOME (Hermes Agent reads this)
+      config.yaml                 gateway config
+      SOUL.md                     identity / style
+      memories/                   MEMORY.md, USER.md (per-turn injections)
+      plugins/                    plugins (dialogue-handoff comes bundled)
+      skills/                     skills (optional)
+    agent-memory/                 durable memory layer
+      state/                      ALWAYS-CONTEXT, DIALOGUE-HANDOFF, NOW, ACTIVE-CONTEXT
+      plans/, episodes/, index/, evidence/, identity/, library/
+      library.db                  FTS5 + embeddings (created on `memoryctl init`)
+    wiki/                         optional canonical projection
+    scripts/                      tooling (hmk, memoryctl, continuityctl, ...)
+
+After bootstrap, the user is expected to clone hermes-agent into ./app and
+create ./venv, then enable the systemd unit. See docs/multi-agent.md.
+
+Modes:
+  --with-wiki-templates   Include starter wiki notes (first bootstrap).
+  --upgrade               Refresh tooling in an existing v3 workspace.
+"""
+from __future__ import annotations
+
+import argparse
+import filecmp
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TEMPLATES = REPO_ROOT / "templates"
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+ENV_TEMPLATE = REPO_ROOT / ".env.template"
+
+# Agent name validation: lowercase alphanumeric + dash, first char not a dash.
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def validate_name(name: str) -> None:
+    """Hard-fail if `name` is not safe as a systemd instance identifier."""
+    if not NAME_RE.match(name):
+        sys.stderr.write(
+            f"ERROR: invalid agent name '{name}'.\n"
+            "       Must match ^[a-z0-9][a-z0-9-]*$ (lowercase alphanumeric\n"
+            "       plus dash, first char not a dash).\n"
+            "       Examples of valid names: hermes-prime, hermes-minecraft-ermitano.\n"
+            "       Agent name is used as a systemd instance identifier (%i)\n"
+            "       and as the workspace basename.\n"
+        )
+        sys.exit(2)
+
+
+def detect_v2_layout(agent_dir: Path) -> bool:
+    """v3 requires hermes-home/. v2 workspaces have agent-memory/ but NO hermes-home/."""
+    if not agent_dir.exists():
+        return False
+    has_agent_memory = (agent_dir / "agent-memory").is_dir()
+    has_hermes_home = (agent_dir / "hermes-home").is_dir()
+    return has_agent_memory and not has_hermes_home
+
+
+# ---- copy helpers ----------------------------------------------------
+
+def copy_if_missing(src: Path, dst: Path) -> None:
+    if dst.exists():
+        return
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def copy_tree_overwrite(src: Path, dst: Path, preserve_exec: bool = False) -> None:
+    if dst.exists():
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    if src.is_dir():
+        shutil.copytree(src, dst)
+    else:
+        shutil.copy2(src, dst)
+    if preserve_exec and dst.is_dir():
+        for p in dst.rglob("*"):
+            if p.suffix == ".sh" or p.name == "hmk":
+                try:
+                    os.chmod(p, 0o755)
+                except Exception:
+                    pass
+
+
+def render_template(src: Path, dst: Path, values: dict) -> None:
+    """Copy `src` to `dst` replacing `{{KEY}}` tokens with values."""
+    text = src.read_text(encoding="utf-8")
+    for k, v in values.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(text, encoding="utf-8")
+
+
+# ---- bootstrap -------------------------------------------------------
+
+HERMES_HOME_SUBDIRS = [
+    "memories",
+    "plugins",
+    "skills",
+    "sessions",
+    "logs",
+    "cron",
+    "audio_cache",
+    "image_cache",
+    "pastes",
+]
+
+AGENT_MEMORY_SUBDIRS = [
+    "state",
+    "plans",
+    "episodes",
+    "index",
+    "evidence",
+    "identity",
+    "library",
+]
+
+
+def bootstrap(agent_dir: Path, name: str, with_wiki_templates: bool) -> None:
+    if detect_v2_layout(agent_dir):
+        sys.stderr.write(
+            f"ERROR: {agent_dir} looks like a v2.x workspace\n"
+            "       (has agent-memory/ but no hermes-home/).\n"
+            "       Auto-upgrade from v2 to v3 is NOT supported by bootstrap.\n"
+            "       See docs/migration-v3.md for the migration playbook.\n"
+        )
+        sys.exit(2)
+
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    values = {
+        "AGENT_NAME": name,
+        "WORKSPACE_ROOT": str(agent_dir),
+        "DEFAULT_MODEL": "nvidia/llama-3.3-nemotron-super-49b-v1",
+        "DEFAULT_PROVIDER": "nvidia",
+        "USER_PROFILE": "<!-- Describe the primary operator here: name, role, style, domains. -->",
+    }
+
+    # AGENTS.md (workspace root)
+    copy_if_missing(TEMPLATES / "AGENTS.md", agent_dir / "AGENTS.md")
+
+    # .env from template
+    if not (agent_dir / ".env").exists():
+        render_template(ENV_TEMPLATE, agent_dir / ".env", values)
+        try:
+            os.chmod(agent_dir / ".env", 0o600)
+        except Exception:
+            pass
+
+    # hermes-home/ skeleton
+    hh = agent_dir / "hermes-home"
+    hh.mkdir(exist_ok=True)
+    for sub in HERMES_HOME_SUBDIRS:
+        (hh / sub).mkdir(exist_ok=True)
+
+    # Rendered templates in hermes-home/
+    if not (hh / "config.yaml").exists():
+        render_template(
+            TEMPLATES / "hermes-home" / "config.yaml.template",
+            hh / "config.yaml",
+            values,
+        )
+    if not (hh / "SOUL.md").exists():
+        render_template(
+            TEMPLATES / "hermes-home" / "SOUL.md.template",
+            hh / "SOUL.md",
+            values,
+        )
+    if not (hh / "memories" / "MEMORY.md").exists():
+        render_template(
+            TEMPLATES / "hermes-home" / "memories" / "MEMORY.md.template",
+            hh / "memories" / "MEMORY.md",
+            values,
+        )
+    if not (hh / "memories" / "USER.md").exists():
+        render_template(
+            TEMPLATES / "hermes-home" / "memories" / "USER.md.template",
+            hh / "memories" / "USER.md",
+            values,
+        )
+
+    # Plugins (dialogue-handoff + whatever else is under templates/plugins)
+    plugins_src = TEMPLATES / "plugins"
+    if plugins_src.exists():
+        for plugin_dir in plugins_src.iterdir():
+            if plugin_dir.is_dir() and not plugin_dir.name.startswith("__"):
+                copy_if_missing(plugin_dir, hh / "plugins" / plugin_dir.name)
+
+    # Skills copy (template skills into hermes-home/skills/)
+    skills_src = TEMPLATES / "skills"
+    if skills_src.exists():
+        for skill_dir in skills_src.iterdir():
+            if skill_dir.is_dir():
+                copy_if_missing(skill_dir, hh / "skills" / skill_dir.name)
+
+    # agent-memory/ skeleton (from templates/memory/)
+    am = agent_dir / "agent-memory"
+    am.mkdir(exist_ok=True)
+    for sub in AGENT_MEMORY_SUBDIRS:
+        (am / sub).mkdir(exist_ok=True)
+
+    # State templates (ALWAYS-CONTEXT, NOW, DIALOGUE-HANDOFF placeholders)
+    mem_tpl = TEMPLATES / "memory"
+    if mem_tpl.exists():
+        for rel in ("state/ALWAYS-CONTEXT.md", "state/NOW.md",
+                    "episodes/HERMES-LOG.md", "index/INDEX.md",
+                    "plans/MEMORY-ARCHITECTURE.md"):
+            src = mem_tpl / rel
+            if src.exists():
+                copy_if_missing(src, am / rel)
+        # DIALOGUE-HANDOFF.md starts from template if present, else empty
+        handoff_src = mem_tpl / "state" / "DIALOGUE-HANDOFF.md"
+        handoff_dst = am / "state" / "DIALOGUE-HANDOFF.md"
+        if handoff_src.exists():
+            copy_if_missing(handoff_src, handoff_dst)
+        if handoff_dst.exists():
+            try:
+                os.chmod(handoff_dst, 0o600)
+            except Exception:
+                pass
+
+    # Wiki
+    wiki = agent_dir / "wiki"
+    wiki.mkdir(exist_ok=True)
+    if with_wiki_templates:
+        wiki_src = TEMPLATES / "wiki"
+        if wiki_src.exists():
+            for entry in wiki_src.iterdir():
+                copy_if_missing(entry, wiki / entry.name)
+
+    # Scripts (hmk wrapper + memoryctl + etc.)
+    copy_if_missing(SCRIPTS_DIR, agent_dir / "scripts")
+    for name_exec in ("hmk", "smoke-test.sh", "bootstrap_agent.py",
+                      "bootstrap_workspace.py", "memoryctl.py",
+                      "continuityctl.py", "ingest_any.py",
+                      "export_obsidian.py", "embed_benchmark.py",
+                      "embed_clear.py", "embed_verify.py"):
+        p = agent_dir / "scripts" / name_exec
+        if p.exists():
+            try:
+                os.chmod(p, 0o755)
+            except Exception:
+                pass
+
+
+def upgrade(agent_dir: Path) -> None:
+    """Refresh tooling in an existing v3 workspace. Preserves user data."""
+    if not agent_dir.exists():
+        sys.stderr.write(f"ERROR: workspace does not exist: {agent_dir}\n")
+        sys.exit(2)
+
+    if detect_v2_layout(agent_dir):
+        sys.stderr.write(
+            f"ERROR: {agent_dir} is a v2.x workspace. --upgrade does NOT\n"
+            "       migrate v2 to v3. See docs/migration-v3.md.\n"
+        )
+        sys.exit(2)
+
+    # Refresh scripts/ and plugins/ (tooling)
+    copy_tree_overwrite(SCRIPTS_DIR, agent_dir / "scripts", preserve_exec=True)
+    for name_exec in ("hmk", "smoke-test.sh"):
+        p = agent_dir / "scripts" / name_exec
+        if p.exists():
+            try:
+                os.chmod(p, 0o755)
+            except Exception:
+                pass
+
+    # Refresh plugins inside hermes-home (not config.yaml / SOUL.md)
+    plugins_src = TEMPLATES / "plugins"
+    hh_plugins = agent_dir / "hermes-home" / "plugins"
+    if plugins_src.exists() and hh_plugins.exists():
+        for plugin_dir in plugins_src.iterdir():
+            if plugin_dir.is_dir() and not plugin_dir.name.startswith("__"):
+                copy_tree_overwrite(plugin_dir, hh_plugins / plugin_dir.name)
+
+    # Refresh skills (same)
+    skills_src = TEMPLATES / "skills"
+    hh_skills = agent_dir / "hermes-home" / "skills"
+    if skills_src.exists() and hh_skills.exists():
+        for skill_dir in skills_src.iterdir():
+            if skill_dir.is_dir():
+                copy_tree_overwrite(skill_dir, hh_skills / skill_dir.name)
+
+    # Refresh .env.template reference (for diffing); keep user's .env intact.
+    # The workspace .env.example is a symlink ideally; this is just a sanity touch.
+    print(f"upgraded tooling + plugins/skills in: {agent_dir}")
+    print("note: config.yaml, SOUL.md, memories/*, .env NOT touched (user data).")
+
+
+def print_next_steps(agent_dir: Path, name: str) -> None:
+    home = str(Path.home())
+    expected = Path(home) / "agents" / name
+    is_standard = str(agent_dir.resolve()) == str(expected.resolve())
+
+    print()
+    print("=" * 60)
+    print(f"  Agent '{name}' bootstrapped at:")
+    print(f"    {agent_dir}")
+    print("=" * 60)
+    print()
+    print("Next steps:")
+    print(f"  cd {agent_dir}")
+    print("  # 1. Fill in API keys and platform tokens in .env")
+    print("  # 2. Clone hermes-agent upstream + install:")
+    print("  git clone https://github.com/NousResearch/hermes-agent.git app")
+    print("  python3 -m venv venv && ./venv/bin/pip install -e ./app")
+    print("  # 3. Enable the systemd user service:")
+    print("  cp scripts/../templates/systemd/hermes-gateway@.service \\")
+    print("     ~/.config/systemd/user/")
+    print("  systemctl --user daemon-reload")
+    if is_standard:
+        print(f"  systemctl --user enable --now hermes-gateway@{name}.service")
+    else:
+        print(f"  # NOTE: {agent_dir} is OUTSIDE the standard ~/agents/{name}/ location.")
+        print("  # The template systemd unit won't find it via %h/agents/%i.")
+        print("  # Use a non-template unit with absolute paths instead.")
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Bootstrap or upgrade a self-contained Hermes agent workspace",
+    )
+    ap.add_argument("agent_dir", help="Agent directory (e.g. ~/agents/hermes-prime)")
+    ap.add_argument("--name", help="Agent name (default: basename of agent_dir)")
+    ap.add_argument("--with-wiki-templates", action="store_true",
+                    help="Copy starter wiki notes into wiki/")
+    ap.add_argument("--upgrade", action="store_true",
+                    help="Refresh tooling in an existing v3 workspace")
+    args = ap.parse_args()
+
+    agent_dir = Path(args.agent_dir).expanduser().resolve()
+    name = args.name or agent_dir.name
+
+    validate_name(name)
+
+    if args.upgrade:
+        upgrade(agent_dir)
+    else:
+        bootstrap(agent_dir, name, args.with_wiki_templates)
+        print_next_steps(agent_dir, name)
+
+
+if __name__ == "__main__":
+    main()

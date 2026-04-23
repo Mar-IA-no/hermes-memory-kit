@@ -1,0 +1,14 @@
+# USER — profile as seen by {{AGENT_NAME}}
+
+<!--
+  What the agent knows about the primary user / operator.
+  Injected into every turn. Keep under `user_char_limit` (default 2200 chars).
+
+  Typical entries:
+    - name, role, preferences
+    - language / tone expectations
+    - domains of expertise
+    - communication constraints
+-->
+
+{{USER_PROFILE}}

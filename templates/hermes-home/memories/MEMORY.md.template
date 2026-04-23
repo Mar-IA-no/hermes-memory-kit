@@ -1,0 +1,18 @@
+# MEMORY — {{AGENT_NAME}}
+
+<!--
+  Durable notes the agent keeps about its environment, conventions, lessons.
+  Written by the agent (and by you) as the deployment evolves.
+
+  Hermes injects this file into every turn. Keep it under `memory_char_limit`
+  (default 3000 chars in config.yaml).
+
+  Good entries:
+    - environmental constraints (hardware limits, ports in use, network topology)
+    - conventions of this deployment (paths, naming, systemd service name)
+    - recurring operational lessons
+
+  Bad entries:
+    - transient state (session IDs, recent conversations)
+    - duplicates of user profile (that goes in USER.md)
+-->
