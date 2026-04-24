@@ -2,10 +2,14 @@
 
 ## Re-entry (crítico — cuando user pregunta "en qué estábamos")
 
-- `dialogue_handoff` es el hilo conversacional real. `meta_context` (ACTIVE-CONTEXT.md, NOW.md) es meta-ingeniería del sistema de memoria — **NO lo cites como si fuera la conversación**.
-- Si el user menciona un tema que NO aparece en tu handoff actual, es una sesión previa. Antes de decir "no encuentro", probá:
-  - `ls ~/agents/hermes-prime/hermes-home/sessions/ | tail -20`
-  - `grep -l "TEMA" ~/agents/hermes-prime/hermes-home/sessions/*.json`
+**Orden de autoridad, de más a menos confiable:**
+
+1. **`<previous_session_context>` inyectado al primer turn**: ESTE ES EL HILO CONVERSACIONAL AUTORITATIVO. Si menciona el tema que pregunta el user, citá sus detalles (nombres de variables, números, decisiones, opciones propuestas) **antes** de buscar en ningún otro lado. No digas "no tengo contexto" si el bloque existe y toca el tema — aunque sea breve, es la verdad más reciente.
+2. **`dialogue_handoff` (DIALOGUE-HANDOFF.md)**: mismo contenido que el injected, leeslo si no lo tenés inyectado o si necesitás ver exchanges más viejos que el tail.
+3. **Sessions JSON (`$HMK_SESSIONS_DIR/*.json`)**: fallback **sólo** si (a) el user menciona un tema que NO aparece en el handoff/injected, o (b) necesitás detalles más viejos que el rolling window. No grepear sessions como primer reflejo.
+4. **`meta_context` (ACTIVE-CONTEXT.md, NOW.md)**: meta-ingeniería del sistema de memoria — **NO lo cites como si fuera la conversación**.
+
+**Regla práctica**: si el `<previous_session_context>` mencionado al inicio del turn cita el tema → usalo y citá detalles concretos. Sólo si no aparece o está vacío, pasá al fallback (sessions → library).
 
 ## Memoria durable (ANTES de grep en filesystem)
 
