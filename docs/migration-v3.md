@@ -153,3 +153,56 @@ systemctl --user enable --now hermes-gateway.service
 - Session history in `hermes-home/sessions/`: moved as part of step 2.
 - The live plugin: replaced outright in step 4. If you had local edits to the v2.1 plugin, port them after dropping in v3.0.
 - Any external cron or systemd timers that referenced the old paths. Grep for `/home/onairam/agent-memory` and `/home/onairam/wiki` before finalizing.
+
+## Upgrading a plugin (critical — avoid silent collisions)
+
+Hermes Agent loads **every directory** under `hermes-home/plugins/` that
+contains a valid `plugin.yaml`. This is independent of `config.yaml:
+plugins.enabled` — the enabled list affects registration of some behaviors,
+but hook-registering plugins run regardless if their directory is present.
+
+Consequence: if you upgrade a plugin by renaming the old directory as a
+sibling (e.g. `plugins/dialogue-handoff.v30.bak/`), the backup **still runs**
+its hooks alongside the live plugin, and the last writer wins. In practice
+this means the new plugin's output gets silently overwritten by the old
+backup's, with no warning in logs. You'll see stale format in whatever file
+the plugin writes and assume the upgrade didn't take.
+
+### Convention: use `hermes-home/plugin-backups/`
+
+`bootstrap_agent.py` creates `hermes-home/plugin-backups/` as part of the
+standard layout. `bootstrap_agent.py --upgrade` rotates the previous plugin
+directory there with a timestamp suffix before copying the new one in.
+Hermes does not scan `plugin-backups/`, so old versions are safe there.
+
+Manual plugin swap (outside `--upgrade`):
+
+```bash
+# Wrong — Hermes loads BOTH:
+mv hermes-home/plugins/my-plugin hermes-home/plugins/my-plugin.v1.bak
+cp -r new-version hermes-home/plugins/my-plugin
+
+# Right — backup is out of the scanned path:
+mkdir -p hermes-home/plugin-backups
+mv hermes-home/plugins/my-plugin hermes-home/plugin-backups/my-plugin.$(date +%Y%m%d-%H%M%S).bak
+cp -r new-version hermes-home/plugins/my-plugin
+```
+
+### Verifying plugin layout health
+
+`memoryctl.py doctor` audits `$HMK_HERMES_HOME/plugins/` for the two most
+common foot-guns:
+
+- **Name collisions**: two or more plugin directories whose `plugin.yaml`
+  declares the same `name`. Indicates a sibling backup got registered as a
+  second active plugin.
+- **Suspect suffixes**: directory names matching `.bak`, `.old`, `.prev`,
+  `.vNN`. Even without a collision, these shouldn't live under `plugins/`.
+
+```bash
+./scripts/hmk memoryctl.py doctor
+# exits 0 if OK, 1 if any issue. Output is JSON for scripting / CI.
+```
+
+Run this after any plugin change and before assuming a new plugin version is
+actually active in production.

@@ -120,6 +120,7 @@ def render_template(src: Path, dst: Path, values: dict) -> None:
 HERMES_HOME_SUBDIRS = [
     "memories",
     "plugins",
+    "plugin-backups",  # see bootstrap_agent.py --upgrade + docs/migration-v3.md
     "skills",
     "sessions",
     "logs",
@@ -201,6 +202,23 @@ def bootstrap(agent_dir: Path, name: str, with_wiki_templates: bool) -> None:
         for plugin_dir in plugins_src.iterdir():
             if plugin_dir.is_dir() and not plugin_dir.name.startswith("__"):
                 copy_if_missing(plugin_dir, hh / "plugins" / plugin_dir.name)
+
+    # plugin-backups/ README: explain the convention so no one drops .bak
+    # sibling directories under hermes-home/plugins/ (which Hermes would
+    # load as active plugins, silently overriding the enabled one).
+    pb_readme = hh / "plugin-backups" / "README.md"
+    if not pb_readme.exists():
+        pb_readme.write_text(
+            "# plugin-backups/\n\n"
+            "Snapshot of plugins rotated out by `bootstrap_agent.py --upgrade`.\n"
+            "Hermes does NOT scan this directory, so stale plugin versions here\n"
+            "will not register hooks and will not override the live plugin.\n\n"
+            "Do NOT place `.bak` copies inside `hermes-home/plugins/` — Hermes\n"
+            "loads every directory with a valid `plugin.yaml` under `plugins/`,\n"
+            "regardless of `config.yaml: plugins.enabled`. A stale sibling runs\n"
+            "its hooks alongside the live one and the last writer wins — silent\n"
+            "source of state corruption. See docs/migration-v3.md.\n"
+        )
 
     # Skills copy (template skills into hermes-home/skills/)
     skills_src = TEMPLATES / "skills"
@@ -304,13 +322,26 @@ def upgrade(agent_dir: Path) -> None:
             except Exception:
                 pass
 
-    # Refresh plugins inside hermes-home (not config.yaml / SOUL.md)
+    # Refresh plugins inside hermes-home (not config.yaml / SOUL.md).
+    # Rotate any existing plugin dir to hermes-home/plugin-backups/ BEFORE the
+    # overwrite. Never leave the old version as a sibling under plugins/: Hermes
+    # loads every valid plugin.yaml regardless of `enabled`, so a stale sibling
+    # silently runs its hooks and overrides the refreshed plugin.
+    import datetime as _dt
     plugins_src = TEMPLATES / "plugins"
     hh_plugins = agent_dir / "hermes-home" / "plugins"
+    hh_backups = agent_dir / "hermes-home" / "plugin-backups"
     if plugins_src.exists() and hh_plugins.exists():
+        hh_backups.mkdir(exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         for plugin_dir in plugins_src.iterdir():
             if plugin_dir.is_dir() and not plugin_dir.name.startswith("__"):
-                copy_tree_overwrite(plugin_dir, hh_plugins / plugin_dir.name)
+                target = hh_plugins / plugin_dir.name
+                if target.exists():
+                    backup = hh_backups / f"{plugin_dir.name}.{ts}.bak"
+                    shutil.move(str(target), str(backup))
+                    print(f"  rotated {plugin_dir.name} → plugin-backups/{backup.name}")
+                copy_tree_overwrite(plugin_dir, target)
 
     # Refresh skills (same)
     skills_src = TEMPLATES / "skills"

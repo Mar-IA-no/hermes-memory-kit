@@ -1286,6 +1286,164 @@ def parse_tags(text):
     return [chunk.strip() for chunk in text.split(",") if chunk.strip()]
 
 
+
+# --- doctor (v3.2+): audit plugin layout for sibling collisions ---
+
+import re as _re_doctor
+
+
+def _parse_plugin_yaml(path: Path) -> dict:
+    """Extract the minimum we need from plugin.yaml without requiring PyYAML.
+    Returns a dict with keys: name, version, provides_hooks (list). Any missing
+    field becomes None / empty list. Multi-line or nested YAML beyond the flat
+    keys above is not attempted — plugin.yaml in the kit format is flat enough.
+    """
+    out = {"name": None, "version": None, "provides_hooks": []}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return out
+    in_hooks = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            if in_hooks and line and not line.startswith((" ", "\t", "-")):
+                in_hooks = False
+            continue
+        if in_hooks:
+            if line.startswith("-") or line.startswith(("  -", " -", "\t-")):
+                item = stripped.lstrip("-").strip().strip("\"\'")
+                if item:
+                    out["provides_hooks"].append(item)
+                continue
+            else:
+                in_hooks = False
+        m = _re_doctor.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)$", stripped)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        val = val.strip("\"\'")
+        if key == "name" and val:
+            out["name"] = val
+        elif key == "version" and val:
+            out["version"] = val
+        elif key == "provides_hooks":
+            if val:
+                out["provides_hooks"] = [x.strip().strip("\"\'[]") for x in val.split(",") if x.strip()]
+            else:
+                in_hooks = True
+    return out
+
+
+def _doctor_hermes_home() -> Path | None:
+    """Resolve HERMES_HOME from env cascade. Returns None if not set."""
+    for key in ("HMK_HERMES_HOME", "HERMES_HOME"):
+        v = os.environ.get(key)
+        if v:
+            return Path(v)
+    return None
+
+
+def doctor() -> dict:
+    """Audit the Hermes plugin layout for common foot-guns.
+
+    Detects:
+      - Sibling collisions: two or more plugin dirs with the same `name:` in
+        their plugin.yaml. Hermes loads ALL of them, and the last writer wins
+        on hooks — silent source of state corruption.
+      - Suspicious suffixes: directories under plugins/ matching .bak/.old/
+        .prev/.vNN. These belong under plugin-backups/ — sibling placement
+        causes the backup to register as an active plugin.
+
+    Output: JSON with keys:
+      ok: bool  (False if any issue found)
+      hermes_home: resolved HERMES_HOME path (or null)
+      plugins_dir: scanned directory (or null)
+      plugins: list of dicts (dir_name, name, version, hooks)
+      issues: list of dicts (kind, detail, dirs)
+    """
+    out = {
+        "ok": True,
+        "hermes_home": None,
+        "plugins_dir": None,
+        "plugins": [],
+        "issues": [],
+    }
+    hh = _doctor_hermes_home()
+    if not hh or not hh.exists():
+        out["ok"] = False
+        out["issues"].append({
+            "kind": "no_hermes_home",
+            "detail": "HMK_HERMES_HOME / HERMES_HOME not set or directory does not exist",
+            "dirs": [],
+        })
+        return out
+    out["hermes_home"] = str(hh)
+    plugins_dir = hh / "plugins"
+    if not plugins_dir.exists():
+        out["ok"] = False
+        out["issues"].append({
+            "kind": "no_plugins_dir",
+            "detail": f"{plugins_dir} does not exist",
+            "dirs": [],
+        })
+        return out
+    out["plugins_dir"] = str(plugins_dir)
+
+    # Collect loadable plugins (anything with a valid plugin.yaml)
+    by_name: dict = {}
+    suspect = []
+    SUSPECT_RE = _re_doctor.compile(r"\.(bak|old|prev|orig)(\.[a-zA-Z0-9_-]+)?$|\.v\d+(\.\d+)*(\.bak)?$")
+    for child in sorted(plugins_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        manifest = child / "plugin.yaml"
+        if not manifest.exists():
+            continue
+        meta = _parse_plugin_yaml(manifest)
+        entry = {
+            "dir_name": child.name,
+            "name": meta["name"],
+            "version": meta["version"],
+            "hooks": meta["provides_hooks"],
+        }
+        out["plugins"].append(entry)
+        if meta["name"]:
+            by_name.setdefault(meta["name"], []).append(child.name)
+        if SUSPECT_RE.search(child.name):
+            suspect.append(child.name)
+
+    # Name collisions
+    for name, dirs in by_name.items():
+        if len(dirs) > 1:
+            out["ok"] = False
+            out["issues"].append({
+                "kind": "name_collision",
+                "detail": (
+                    f"multiple plugin directories declare name={name!r}. "
+                    "Hermes loads all of them and their hooks run in parallel; "
+                    "the last writer wins. Move stale copies to plugin-backups/."
+                ),
+                "dirs": dirs,
+            })
+
+    # Suspect directory suffixes
+    if suspect:
+        out["ok"] = False
+        out["issues"].append({
+            "kind": "suspect_suffix",
+            "detail": (
+                "directory names match backup/old patterns. Even if unreferenced "
+                "in config.yaml, Hermes will load them if they contain a valid "
+                "plugin.yaml. Move to plugin-backups/ to silence."
+            ),
+            "dirs": suspect,
+        })
+
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="Local memory control for Hermes")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1349,6 +1507,8 @@ def main():
     p_hybrid.add_argument("--threshold", type=float, default=0.40)
     p_hybrid.add_argument("--provider", default=default_embed_provider())
     p_hybrid.add_argument("--model")
+
+    sub.add_parser("doctor", help="audit HERMES_HOME/plugins/ for sibling collisions + suspect suffixes")
 
     args = parser.parse_args()
 
@@ -1415,6 +1575,10 @@ def main():
                 ensure_ascii=False,
             )
         )
+    elif args.command == "doctor":
+        result = doctor()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        raise SystemExit(0 if result["ok"] else 1)
     else:
         raise SystemExit(f"unknown command: {args.command}")
 
