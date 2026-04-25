@@ -1,12 +1,29 @@
-"""hermes-continuity-plugin v1.0.0 — conversational continuity for Hermes.
+"""hermes-continuity-plugin v1.1.0 — conversational continuity for Hermes.
 
 Working memory plugin: persists last-N substantive turns and injects them at
 the start of new sessions. Anti-amnesia layer between sessions/crashes/model
 switches/context compaction.
 
-Equivalent in code to dialogue-handoff v3.1.0 bundled inside hermes-memory-kit
-(commit b3b449e + 0e499d8). Re-numbered to v1.0.0 because this is the first
-release as a standalone repo.
+v1.0.0 → v1.1.0 (backwards-compat):
+  - NEW: per-platform handoff files. When `platform` is non-empty and not
+    "cli", the handoff is read/written from `<base>.<platform>.md` instead of
+    the legacy `<base>.md`. Examples:
+        platform=""        → DIALOGUE-HANDOFF.md (legacy, default)
+        platform="cli"     → DIALOGUE-HANDOFF.md (legacy, default)
+        platform="minecraft" → DIALOGUE-HANDOFF.minecraft.md
+        platform="telegram"  → DIALOGUE-HANDOFF.telegram.md
+    The CLI platform keeps using the legacy file so existing deploys don't
+    break and so any tooling that watches DIALOGUE-HANDOFF.md keeps working.
+    Non-CLI platforms get their own file so a Minecraft session never
+    contaminates the working memory of a CLI/Telegram conversation.
+  - NEW: optional fallback to legacy file when the per-platform file does
+    not exist yet (env var `HERMES_HANDOFF_FALLBACK_LEGACY=true|false`,
+    default `false`). Useful for upgrade-in-place: first turn of a new
+    platform can still see the existing legacy handoff if you opt in.
+
+Equivalent in core logic to dialogue-handoff v3.1.0 bundled inside
+hermes-memory-kit (commit b3b449e + 0e499d8). Re-numbered to v1.0.0 because
+that was the first release as a standalone repo; v1.1.0 adds per-platform.
 
 Compatibility: hermes-memory-kit ≥ v3.1.0 (when used vendored).
                 Standalone (any Hermes Agent ≥ v0.10) when used drop-in.
@@ -113,6 +130,47 @@ _SESSIONS_DIR = (
     _resolve_path(["HERMES_SESSIONS_DIR", "HMK_SESSIONS_DIR"])
     or (_HERMES_HOME / "sessions" if _HERMES_HOME else None)
 )
+
+def _per_platform_path(base_path: Optional[Path], platform: str) -> Optional[Path]:
+    """Derive a per-platform handoff file from the resolved base handoff path.
+
+    Convention (v1.1.0):
+      platform=""        → base_path (legacy DIALOGUE-HANDOFF.md, no suffix)
+      platform="cli"     → base_path (legacy, no suffix)
+      platform=anything  → base_path with `.<platform>` injected before ext
+
+    Examples (base=/x/state/DIALOGUE-HANDOFF.md):
+      ""        → /x/state/DIALOGUE-HANDOFF.md
+      "cli"     → /x/state/DIALOGUE-HANDOFF.md
+      "minecraft" → /x/state/DIALOGUE-HANDOFF.minecraft.md
+      "telegram"  → /x/state/DIALOGUE-HANDOFF.telegram.md
+
+    Works for any base path — kit-integrated, direct-paths-only, or standalone
+    defaults. Does NOT assume a specific layout under <agent_memory_base>."""
+    if base_path is None:
+        return None
+    if not platform or platform.lower() == "cli":
+        return base_path
+    stem = base_path.stem  # 'DIALOGUE-HANDOFF'
+    ext = base_path.suffix or ".md"  # '.md'
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", platform.strip().lower())
+    return base_path.with_name(f"{stem}.{safe}{ext}")
+
+
+def _resolve_handoff_path(platform: str = "") -> Optional[Path]:
+    """Resolve the handoff path for the given platform, with optional
+    fallback to the legacy file when the per-platform file does not exist
+    (env var HERMES_HANDOFF_FALLBACK_LEGACY=true)."""
+    primary = _per_platform_path(_HANDOFF_PATH, platform)
+    if primary is None:
+        return None
+    if primary.exists():
+        return primary
+    fallback_enabled = (os.environ.get("HERMES_HANDOFF_FALLBACK_LEGACY") or "").strip().lower() in ("1", "true", "yes")
+    if fallback_enabled and _HANDOFF_PATH and _HANDOFF_PATH != primary and _HANDOFF_PATH.exists():
+        return _HANDOFF_PATH
+    return primary  # may not exist yet — caller handles
+
 
 _CONFIG_OK = all([_HANDOFF_PATH, _ALWAYS_CONTEXT_PATH, _SESSIONS_DIR])
 if not _CONFIG_OK:
@@ -353,14 +411,18 @@ def _format_recent_exchanges_block(exchanges: List[Dict[str, str]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _read_existing_tail() -> List[Dict[str, str]]:
-    if not _HANDOFF_PATH or not _HANDOFF_PATH.exists():
+def _read_existing_tail(platform: str = "") -> List[Dict[str, str]]:
+    """Read the Recent Exchanges tail from the per-platform handoff file.
+    Falls back to legacy file if HERMES_HANDOFF_FALLBACK_LEGACY=true and
+    the per-platform file does not exist yet."""
+    path = _resolve_handoff_path(platform)
+    if not path or not path.exists():
         return []
     try:
-        text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
         return _parse_recent_exchanges(text)
     except Exception as exc:
-        logger.warning("dialogue-handoff: could not parse existing tail: %s", exc)
+        logger.warning("dialogue-handoff: could not parse existing tail at %s: %s", path, exc)
         return []
 
 
@@ -390,8 +452,8 @@ def _on_post_llm_call(
         # v3.1: decide if this turn is substantive.
         sustantivo = _is_substantive(um, ar)
 
-        # Build/update the Recent Exchanges tail.
-        tail = _read_existing_tail()
+        # Build/update the Recent Exchanges tail (per-platform).
+        tail = _read_existing_tail(platform=platform)
         if sustantivo:
             new_entry = {
                 "header": f"Exchange @ {now_iso} ({platform or 'cli'}, session {session_id or '?'})",
@@ -441,10 +503,16 @@ def _on_post_llm_call(
                 "",
             ]
 
-        _HANDOFF_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _HANDOFF_PATH.write_text("\n".join(lines), encoding="utf-8")
+        # Write to per-platform handoff file. CLI / empty platform writes to
+        # the legacy DIALOGUE-HANDOFF.md path (back-compat); non-CLI platforms
+        # get their own file (DIALOGUE-HANDOFF.<platform>.md).
+        write_path = _per_platform_path(_HANDOFF_PATH, platform)
+        if write_path is None:
+            return
+        write_path.parent.mkdir(parents=True, exist_ok=True)
+        write_path.write_text("\n".join(lines), encoding="utf-8")
         try:
-            os.chmod(_HANDOFF_PATH, 0o600)
+            os.chmod(write_path, 0o600)
         except Exception:
             pass
     except Exception as e:
@@ -697,6 +765,7 @@ def _on_pre_llm_call(
     user_message: str = "",
     conversation_history: List[Dict[str, Any]] = None,
     is_first_turn: bool = False,
+    platform: str = "",
     **_ignored: Any,
 ) -> Any:
     if not _CONFIG_OK:
@@ -711,11 +780,15 @@ def _on_pre_llm_call(
         # Layer 1 (v2.1): always-context
         always_block = _load_always_context()
 
-        # Layer 2: dialogue handoff (v3.1 tail-first, v3.0 JSON fallback)
+        # Layer 2 (v1.1.0): per-platform dialogue handoff. Reads the file that
+        # corresponds to the current `platform` arg ("cli"/"" → legacy file,
+        # else DIALOGUE-HANDOFF.<platform>.md). Optionally falls back to legacy
+        # file if HERMES_HANDOFF_FALLBACK_LEGACY=true (upgrade-in-place help).
         handoff_block = ""
         try:
-            if _HANDOFF_PATH and _HANDOFF_PATH.exists():
-                text = _HANDOFF_PATH.read_text(encoding="utf-8", errors="replace")
+            handoff_path = _resolve_handoff_path(platform)
+            if handoff_path and handoff_path.exists():
+                text = handoff_path.read_text(encoding="utf-8", errors="replace")
                 handoff = _parse_handoff_md(text)
                 if handoff.get("last_user_message") and handoff["last_user_message"] != "none" and not _is_stale(handoff):
                     # Try v3.1 path: parsed tail from handoff itself (no JSON)

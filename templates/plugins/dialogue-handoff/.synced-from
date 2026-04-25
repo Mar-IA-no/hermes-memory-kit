@@ -1,6 +1,6 @@
 source: https://github.com/Mar-IA-no/hermes-continuity-plugin.git
-tag: v1.0.0
-synced_at: 2026-04-24T21:10:00Z
-generated_by: scripts/sync-continuity-plugin.sh (initial commit, pre-publish — synced manually from /home/onairam/hermes-continuity-plugin)
+tag: v1.1.0
+synced_at: 2026-04-25T02:17:05Z
+generated_by: scripts/sync-continuity-plugin.sh (manual sync from /home/onairam/hermes-continuity-plugin/ pre-push to remote)
 # GENERATED FILE — DO NOT EDIT manually. Edits to plugin code should go to
 # the standalone repo (source of truth) and be re-synced.
