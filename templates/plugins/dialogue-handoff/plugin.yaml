@@ -1,5 +1,5 @@
 name: dialogue-handoff
-version: 1.1.1
+version: 1.1.2
 description: "Working memory plugin for Hermes Agent. post_llm_call persists a Recent Exchanges tail (verbatim multi-line, last N=4 substantive turns) in DIALOGUE-HANDOFF.md (or DIALOGUE-HANDOFF.<platform>.md for non-CLI platforms); pre_llm_call reads that tail directly and injects it into the first turn of new sessions, so the model picks up the thread without reopening session JSON. Per-platform separation (v1.1.0) prevents working memory contamination when one Hermes lives in multiple channels (CLI, Telegram, Minecraft) at once. Gated by substantive-turn threshold so trivial echoes do not overwrite the real conversation tail. Env var cascade: HERMES_HANDOFF_PATH / HERMES_ALWAYS_CONTEXT_PATH / HERMES_SESSIONS_DIR (canonical) with HMK_* legacy fallback, or derive from HERMES_AGENT_MEMORY_BASE + HERMES_HOME. logger.warning() once when legacy is matched."
 author: "hermes-continuity-plugin"
 compatibility: "hermes-memory-kit >= v3.1.0; standalone with any Hermes Agent >= v0.10"

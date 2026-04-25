@@ -1,15 +1,21 @@
-"""hermes-continuity-plugin v1.1.1 — conversational continuity for Hermes.
+"""hermes-continuity-plugin v1.1.2 — conversational continuity for Hermes.
 
 Working memory plugin: persists last-N substantive turns and injects them at
 the start of new sessions. Anti-amnesia layer between sessions/crashes/model
 switches/context compaction.
 
-v1.1.0 → v1.1.1 (backwards-compat):
-  - FIX: when the host runtime calls hooks without a `platform` kwarg (e.g.
-    `hermes chat -q` hardcodes `platform="cli"`), the plugin now falls back
-    to the `HERMES_PLATFORM` env var as an override. Lets the same agent
-    process serve different platforms by setting HERMES_PLATFORM before each
-    invocation. The kwarg still wins when present.
+v1.1.1 → v1.1.2 (backwards-compat):
+  - FIX (real): hermes CLI passes `platform="cli"` explicitly to hooks,
+    so the v1.1.1 fallback never triggered (the truthy kwarg won). v1.1.2
+    treats `platform="cli"` as the default-replaceable-by-env case: when
+    HERMES_PLATFORM is set, it wins over a literal "cli" kwarg. Other
+    kwarg values (telegram, discord, gateway-set) keep winning.
+
+v1.1.0 → v1.1.1 (backwards-compat, retained):
+  - FIX: when the host runtime calls hooks without a `platform` kwarg, the
+    plugin falls back to the `HERMES_PLATFORM` env var as an override.
+    Lets the same agent process serve different platforms by setting
+    HERMES_PLATFORM before each invocation.
 
 v1.0.0 → v1.1.0 (backwards-compat):
   - NEW: per-platform handoff files. When `platform` is non-empty and not
@@ -165,13 +171,26 @@ def _per_platform_path(base_path: Optional[Path], platform: str) -> Optional[Pat
 
 
 def _resolve_platform(provided: str) -> str:
-    """Effective platform: explicit kwarg wins; otherwise fall back to
-    HERMES_PLATFORM env var. Env-var fallback (v1.1.1) lets the same agent
-    process (e.g. `hermes chat -q`) serve different platforms by setting
-    HERMES_PLATFORM before invocation, since the CLI hardcodes platform="cli"."""
-    if provided:
-        return provided
-    return os.environ.get("HERMES_PLATFORM", "") or ""
+    """Effective platform with three-tier resolution (v1.1.2):
+
+    1. Explicit non-default kwarg wins. e.g. `platform="telegram"` from a
+       gateway always wins over any env.
+    2. If kwarg is absent OR is literal `"cli"` (the default that
+       `hermes chat -q` hardcodes), fall back to HERMES_PLATFORM env var.
+       This lets the operator point a CLI invocation at a non-CLI platform
+       by setting `HERMES_PLATFORM=minecraft` before invocation.
+    3. If both are empty, return `""` → legacy DIALOGUE-HANDOFF.md path
+       (back-compat with v1.0).
+
+    Why treat "cli" as replaceable: Hermes Agent CLI always passes
+    platform="cli" to plugin hooks. Without this rule, the env override
+    in v1.1.1 never triggered because the kwarg was always truthy."""
+    env_val = os.environ.get("HERMES_PLATFORM", "") or ""
+    if not provided:
+        return env_val
+    if provided.lower() == "cli" and env_val:
+        return env_val
+    return provided
 
 
 def _resolve_handoff_path(platform: str = "") -> Optional[Path]:

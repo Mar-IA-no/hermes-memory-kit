@@ -1,1 +1,1 @@
-v1.1.1  # equivalent to standalone v1.1.1 (HERMES_PLATFORM env fallback)
+v1.1.2  # equivalent to standalone v1.1.2 (cli-replaceable-by-env fix)
