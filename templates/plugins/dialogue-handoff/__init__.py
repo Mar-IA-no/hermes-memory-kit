@@ -1,8 +1,15 @@
-"""hermes-continuity-plugin v1.1.0 — conversational continuity for Hermes.
+"""hermes-continuity-plugin v1.1.1 — conversational continuity for Hermes.
 
 Working memory plugin: persists last-N substantive turns and injects them at
 the start of new sessions. Anti-amnesia layer between sessions/crashes/model
 switches/context compaction.
+
+v1.1.0 → v1.1.1 (backwards-compat):
+  - FIX: when the host runtime calls hooks without a `platform` kwarg (e.g.
+    `hermes chat -q` hardcodes `platform="cli"`), the plugin now falls back
+    to the `HERMES_PLATFORM` env var as an override. Lets the same agent
+    process serve different platforms by setting HERMES_PLATFORM before each
+    invocation. The kwarg still wins when present.
 
 v1.0.0 → v1.1.0 (backwards-compat):
   - NEW: per-platform handoff files. When `platform` is non-empty and not
@@ -155,6 +162,16 @@ def _per_platform_path(base_path: Optional[Path], platform: str) -> Optional[Pat
     ext = base_path.suffix or ".md"  # '.md'
     safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", platform.strip().lower())
     return base_path.with_name(f"{stem}.{safe}{ext}")
+
+
+def _resolve_platform(provided: str) -> str:
+    """Effective platform: explicit kwarg wins; otherwise fall back to
+    HERMES_PLATFORM env var. Env-var fallback (v1.1.1) lets the same agent
+    process (e.g. `hermes chat -q`) serve different platforms by setting
+    HERMES_PLATFORM before invocation, since the CLI hardcodes platform="cli"."""
+    if provided:
+        return provided
+    return os.environ.get("HERMES_PLATFORM", "") or ""
 
 
 def _resolve_handoff_path(platform: str = "") -> Optional[Path]:
@@ -438,6 +455,8 @@ def _on_post_llm_call(
     if not _CONFIG_OK:
         return
     try:
+        # v1.1.1: HERMES_PLATFORM env-var override when no platform kwarg.
+        platform = _resolve_platform(platform)
         um = (user_message or "").strip()
         ar = (assistant_response or "").strip()
         # Basic sanity: skip command-only turns (/reset, /model, etc.) and very empty
@@ -771,6 +790,8 @@ def _on_pre_llm_call(
     if not _CONFIG_OK:
         return None
     try:
+        # v1.1.1: HERMES_PLATFORM env-var override when no platform kwarg.
+        platform = _resolve_platform(platform)
         if not is_first_turn:
             return None
         um = (user_message or "").strip()

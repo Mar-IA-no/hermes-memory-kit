@@ -1,1 +1,1 @@
-v1.1.0  # equivalent to standalone v1.1.0 (per-platform handoff)
+v1.1.1  # equivalent to standalone v1.1.1 (HERMES_PLATFORM env fallback)
