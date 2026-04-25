@@ -74,11 +74,15 @@ DEFAULT_EMBED_MODELS = {
     "nvidia": "nvidia/llama-3.2-nemoretriever-300m-embed-v1",
     "google": "gemini-embedding-001",
     "local": "sentence-transformers/all-MiniLM-L6-v2",
+    "model2vec": "minishlab/potion-retrieval-32M",
 }
 DEFAULT_EMBED_OUTPUT_DIMS = {
     "google": 768,
+    "model2vec": 512,
 }
 LOCAL_MODEL_CACHE = {}
+MODEL2VEC_CACHE = {}
+FLASHRANK_CACHE = {}
 PROJECT_QUERY_TERMS = {
     "hermes",
     "openclaw",
@@ -164,6 +168,20 @@ def connect():
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA busy_timeout=30000")
     return con
+
+
+def migrate_add_embedding_bin(con):
+    """Additive migration: add embedding_bin BLOB column if missing."""
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='chapter_embeddings'"
+    ).fetchone()
+    if not row:
+        return
+    columns = con.execute("PRAGMA table_info(chapter_embeddings)").fetchall()
+    column_names = {col["name"] for col in columns}
+    if "embedding_bin" not in column_names:
+        con.execute("ALTER TABLE chapter_embeddings ADD COLUMN embedding_bin BLOB")
+        con.commit()
 
 
 def migrate_embedding_table(con):
@@ -295,6 +313,7 @@ def init_db():
           input_text_hash TEXT NOT NULL,
           dims INTEGER NOT NULL,
           embedding_json TEXT NOT NULL,
+          embedding_bin BLOB,
           created_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
           PRIMARY KEY (chapter_id, provider, model)
@@ -305,6 +324,7 @@ def init_db():
         """
     )
     migrate_embedding_table(con)
+    migrate_add_embedding_bin(con)
     for name, description in DEFAULT_SHELVES.items():
         con.execute(
             "INSERT OR IGNORE INTO shelves(name, description) VALUES(?, ?)",
@@ -628,6 +648,25 @@ def embed_texts_local(texts, input_type="passage", model=None):
     return [list(map(float, row.tolist())) for row in vectors]
 
 
+def embed_texts_model2vec(texts, input_type="passage", model=None):
+    """Static embeddings via Model2Vec (CPU-only, no torch in hot path).
+    Returns list of float vectors. Default model: minishlab/potion-retrieval-32M.
+    No prefix scheme (potion models don't expect query/passage tokens)."""
+    model = normalize_embed_model("model2vec", model)
+    try:
+        from model2vec import StaticModel
+    except Exception as exc:
+        raise SystemExit(
+            "model2vec backend unavailable: pip install model2vec (CPU-only static embeddings)"
+        ) from exc
+    cache_key = (model,)
+    if cache_key not in MODEL2VEC_CACHE:
+        MODEL2VEC_CACHE[cache_key] = StaticModel.from_pretrained(model)
+    encoder = MODEL2VEC_CACHE[cache_key]
+    vectors = encoder.encode(texts, show_progress_bar=False)
+    return [list(map(float, row.tolist())) for row in vectors]
+
+
 def embed_texts(provider, texts, input_type="passage", model=None, output_dimensionality=None):
     provider = normalize_embed_provider(provider)
     model = normalize_embed_model(provider, model)
@@ -642,7 +681,79 @@ def embed_texts(provider, texts, input_type="passage", model=None, output_dimens
         )
     if provider == "local":
         return embed_texts_local(texts, input_type=input_type, model=model)
+    if provider == "model2vec":
+        return embed_texts_model2vec(texts, input_type=input_type, model=model)
     raise SystemExit(f"unsupported embedding provider: {provider}")
+
+
+def quantize_binary(vector):
+    """Quantize a float32 vector to bit-packed bytes by sign.
+    bit i = 1 iff vector[i] >= 0. Returns ceil(dim/8) bytes."""
+    dim = len(vector)
+    out = bytearray((dim + 7) // 8)
+    for i, v in enumerate(vector):
+        if v >= 0.0:
+            out[i >> 3] |= 1 << (i & 7)
+    return bytes(out)
+
+
+def hamming_distance(a, b):
+    """Hamming distance between two equal-length bytes objects (popcount of XOR).
+    Pure Python; for ~50k chapter scans this is fine. If perf becomes an issue
+    later, replace with numpy uint8 view + bit-count."""
+    if len(a) != len(b):
+        return max(len(a), len(b)) * 8
+    return sum(bin(x ^ y).count("1") for x, y in zip(a, b))
+
+
+def cosine_similarity_packed(query_vec, passage_vec):
+    """Float32 cosine similarity (rescore stage after binary ANN)."""
+    return cosine_similarity(query_vec, passage_vec)
+
+
+def flashrank_rerank(query, passages, model_name=None, cache_dir=None, top_k=None):
+    """Rerank passages with FlashRank cross-encoder. Each passage must be a dict
+    with at least 'id' and 'text' keys. Returns list of dicts with added 'score'
+    and ordered desc by score. If FlashRank is not installed or load fails,
+    returns passages unchanged.
+    """
+    model_name = (model_name or os.environ.get("HERMES_RERANK_MODEL")
+                  or "ms-marco-TinyBERT-L-2-v2")
+    cache_dir = cache_dir or os.environ.get("HERMES_RERANK_CACHE_DIR") or "/tmp/flashrank-cache"
+    try:
+        from flashrank import Ranker, RerankRequest
+    except Exception:
+        return passages
+    cache_key = (model_name, cache_dir)
+    if cache_key not in FLASHRANK_CACHE:
+        try:
+            FLASHRANK_CACHE[cache_key] = Ranker(model_name=model_name, cache_dir=cache_dir)
+        except Exception as exc:
+            sys.stderr.write(f"flashrank load failed: {exc} — falling back to no-rerank\n")
+            FLASHRANK_CACHE[cache_key] = None
+    ranker = FLASHRANK_CACHE[cache_key]
+    if ranker is None:
+        return passages
+    try:
+        req = RerankRequest(query=query, passages=passages)
+        ranked = ranker.rerank(req)
+    except Exception as exc:
+        sys.stderr.write(f"flashrank rerank failed: {exc} — falling back to no-rerank\n")
+        return passages
+    if top_k:
+        return ranked[:top_k]
+    return ranked
+
+
+def rerank_provider_default():
+    """env-controlled rerank provider. flashrank|none. Default: flashrank if
+    installed, else none."""
+    explicit = (os.environ.get("HERMES_RERANK_PROVIDER") or "").strip().lower()
+    if explicit:
+        return explicit
+    if importlib.util.find_spec("flashrank") is not None:
+        return "flashrank"
+    return "none"
 
 
 def embeddings_runtime_config(provider=None, model=None):
@@ -659,6 +770,7 @@ def embeddings_capabilities():
     return {
         "default_provider": default_embed_provider(),
         "default_model": default_embed_model(),
+        "rerank_provider": rerank_provider_default(),
         "providers": {
             "nvidia": {
                 "configured": bool(read_env_key("NVIDIA_API_KEY")),
@@ -670,11 +782,13 @@ def embeddings_capabilities():
                 "default_output_dimensionality": default_embed_output_dimensionality("google"),
             },
             "local": {
-                "configured": bool(
-                    importlib.util.find_spec("sentence_transformers")
-                    or importlib.util.find_spec("sentence_transformers")
-                ),
+                "configured": bool(importlib.util.find_spec("sentence_transformers")),
                 "default_model": default_embed_model("local"),
+            },
+            "model2vec": {
+                "configured": bool(importlib.util.find_spec("model2vec")),
+                "default_model": default_embed_model("model2vec"),
+                "default_output_dimensionality": default_embed_output_dimensionality("model2vec"),
             },
         },
     }
@@ -682,16 +796,18 @@ def embeddings_capabilities():
 
 def upsert_embedding(con, chapter_id, provider, model, source_text, vector):
     now = now_ts()
+    binary = quantize_binary(vector)
     con.execute(
         """
-        INSERT INTO chapter_embeddings(chapter_id, provider, model, input_text_hash, dims, embedding_json, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chapter_embeddings(chapter_id, provider, model, input_text_hash, dims, embedding_json, embedding_bin, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chapter_id, provider, model) DO UPDATE SET
           provider=excluded.provider,
           model=excluded.model,
           input_text_hash=excluded.input_text_hash,
           dims=excluded.dims,
           embedding_json=excluded.embedding_json,
+          embedding_bin=excluded.embedding_bin,
           updated_at=excluded.updated_at
         """,
         (
@@ -701,6 +817,7 @@ def upsert_embedding(con, chapter_id, provider, model, source_text, vector):
             text_hash(source_text),
             len(vector),
             json.dumps(vector),
+            binary,
             now,
             now,
         ),
@@ -923,7 +1040,18 @@ def backfill_embeddings(provider=None, model=None, batch_size=8, limit=0, only_m
     return {"processed": processed, "provider": provider, "model": model}
 
 
-def semantic_search(query, limit=8, provider=None, model=None):
+def semantic_search(query, limit=8, provider=None, model=None, use_binary=None):
+    """Semantic search via embeddings.
+
+    If use_binary is True (default when binary embeddings exist), does a two-pass:
+    1. Hamming distance over embedding_bin (BLOB, fast popcount) → top 4*limit
+    2. Rescore with float32 cosine over embedding_json on the top survivors
+    Total cost is dominated by stage 2 over a small subset, so this is much
+    faster than full-scan cosine on 200+ chapters.
+
+    If embedding_bin is missing for the matched provider/model rows (legacy data
+    from before the migration), falls back to full-scan float32 cosine.
+    """
     cfg = embeddings_runtime_config(provider=provider, model=model)
     provider = cfg["provider"]
     model = cfg["model"]
@@ -955,7 +1083,9 @@ def semantic_search(query, limit=8, provider=None, model=None):
           b.title AS book_title,
           b.source_path,
           s.name AS shelf,
-          e.embedding_json
+          e.embedding_json,
+          e.embedding_bin,
+          e.dims
         FROM chapter_embeddings e
         JOIN chapters c ON c.id = e.chapter_id
         JOIN books b ON b.id = c.book_id
@@ -965,13 +1095,31 @@ def semantic_search(query, limit=8, provider=None, model=None):
         (provider, model),
     ).fetchall()
     con.close()
+    if not rows:
+        return []
+
+    have_binary = all(r["embedding_bin"] is not None for r in rows)
+    use_binary = have_binary if use_binary is None else (use_binary and have_binary)
+
+    candidates = rows
+    if use_binary:
+        query_bin = quantize_binary(query_vec)
+        binary_scored = []
+        for row in rows:
+            dist = hamming_distance(query_bin, row["embedding_bin"])
+            binary_scored.append((dist, row))
+        binary_scored.sort(key=lambda x: x[0])
+        prefilter = max(limit * 4, 32)
+        candidates = [row for _, row in binary_scored[:prefilter]]
+
     scored = []
-    for row in rows:
+    for row in candidates:
         data = dict(row)
         vec = json.loads(data["embedding_json"])
         data["semantic_score"] = round(cosine_similarity(query_vec, vec), 6)
         data["tags"] = json.loads(data["tags_json"] or "[]")
         data.pop("embedding_json", None)
+        data.pop("embedding_bin", None)
         scored.append(data)
     scored.sort(key=lambda r: r["semantic_score"], reverse=True)
     return scored[:limit]
@@ -1081,6 +1229,30 @@ def hybrid_pack(query, budget_tokens=4000, limit=8, threshold=0.40, provider=Non
         ranked.append(row)
     ranked.sort(key=lambda r: r["score"], reverse=True)
 
+    # Cross-encoder rerank stage (Fase 1 v3.4): if FlashRank is available and
+    # enabled via env, take top candidates from Park scoring and rerank by
+    # query-passage relevance, then blend with the Park score (50/50).
+    rerank_provider = rerank_provider_default()
+    if rerank_provider == "flashrank" and ranked:
+        rerank_pool = max(limit * 4, 16)
+        head = ranked[:rerank_pool]
+        passages = [
+            {"id": str(r["id"]), "text": f"{r['title']}\n\n{r['spr']}"}
+            for r in head
+        ]
+        reranked = flashrank_rerank(query, passages)
+        if reranked and isinstance(reranked, list) and "score" in reranked[0]:
+            score_by_id = {p["id"]: float(p.get("score", 0.0)) for p in reranked}
+            max_rerank = max(score_by_id.values()) or 1.0
+            for r in head:
+                rerank_score = score_by_id.get(str(r["id"]), 0.0) / max_rerank
+                r["rerank_score"] = round(rerank_score, 4)
+                # Blend Park scoring + rerank 50/50 (rerank emphasizes
+                # query-passage semantic match; Park brings recency/importance).
+                r["score"] = round(0.5 * r["score"] + 0.5 * rerank_score, 4)
+            head.sort(key=lambda r: r["score"], reverse=True)
+            ranked = head + ranked[rerank_pool:]
+
     if not ranked or ranked[0]["score"] < threshold:
         result = {
             "query": query,
@@ -1112,21 +1284,22 @@ def hybrid_pack(query, budget_tokens=4000, limit=8, threshold=0.40, provider=Non
     items = []
     for row in sandwich_order(chosen):
         neighbors = linked_neighbors(row["id"])[:3]
-        items.append(
-            {
-                "id": row["id"],
-                "shelf": row["shelf"],
-                "book_title": row["book_title"],
-                "title": row["title"],
-                "score": row["score"],
-                "lexical_score": round(float(row.get("lexical_score", 0.0)), 4),
-                "semantic_score": round(float(row.get("semantic_score", 0.0)), 4),
-                "spr": row["spr"],
-                "source_path": row["source_path"],
-                "neighbors": neighbors,
-                "citation": f"[mem:{row['id']}]",
-            }
-        )
+        item = {
+            "id": row["id"],
+            "shelf": row["shelf"],
+            "book_title": row["book_title"],
+            "title": row["title"],
+            "score": row["score"],
+            "lexical_score": round(float(row.get("lexical_score", 0.0)), 4),
+            "semantic_score": round(float(row.get("semantic_score", 0.0)), 4),
+            "spr": row["spr"],
+            "source_path": row["source_path"],
+            "neighbors": neighbors,
+            "citation": f"[mem:{row['id']}]",
+        }
+        if "rerank_score" in row:
+            item["rerank_score"] = round(float(row["rerank_score"]), 4)
+        items.append(item)
         touch_access(row["id"])
 
     result = {
