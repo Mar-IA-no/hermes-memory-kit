@@ -1,34 +1,47 @@
-"""dialogue-handoff plugin v3.1 — conversational continuity for Hermes.
+"""hermes-continuity-plugin v1.0.0 — conversational continuity for Hermes.
 
-v3.0 → v3.1 (backwards-compat with v3.0 handoffs):
-  - FIX: _trunc() now preserves multi-line content. Previously it kept only
-    the first line of any text with \\n, mutilating markdown responses. Now
-    it truncates to char budget preserving newlines.
-  - NEW: DIALOGUE-HANDOFF.md persists a self-contained `## Recent Exchanges`
-    block — verbatim tail of the last N substantive turns. pre_llm_call reads
-    that directly; no need to reopen session JSON for the canonical injection.
-    (Fallback to JSON reading remains for legacy handoffs without the block.)
-  - NEW: post_llm_call gates trivial turns. If user+asst content is below
-    threshold (_SUBSTANTIVE_MIN_CHARS), metadata is updated but the Recent
-    Exchanges tail is NOT modified — "en qué estábamos?" no longer overwrites
-    the real conversation tail with its trivial echo.
-  - Budgets recalibrated for the new multi-line-preserving policy.
+Working memory plugin: persists last-N substantive turns and injects them at
+the start of new sessions. Anti-amnesia layer between sessions/crashes/model
+switches/context compaction.
 
-v2.1 → v3.0 (BREAKING, preserved):
-  - ALL hardcoded fallbacks to /home/onairam/... REMOVED. The plugin requires
-    HMK_DIALOGUE_HANDOFF_PATH / HMK_ALWAYS_CONTEXT_PATH / HMK_SESSIONS_DIR
-    (or HMK_AGENT_MEMORY_BASE + HMK_HERMES_HOME) resolvable via env cascade;
-    otherwise the plugin disables itself (hooks become no-op) and logs an error.
+Equivalent in code to dialogue-handoff v3.1.0 bundled inside hermes-memory-kit
+(commit b3b449e + 0e499d8). Re-numbered to v1.0.0 because this is the first
+release as a standalone repo.
 
-v2.0 → v2.1 (preserved):
-  - ALWAYS-CONTEXT.md layer (user-editable, workspace-local, always injected).
+Compatibility: hermes-memory-kit ≥ v3.1.0 (when used vendored).
+                Standalone (any Hermes Agent ≥ v0.10) when used drop-in.
 
-v1.1 → v2.0 (preserved):
-  - pre_llm_call hook. On first turn of new session, injects continuity block.
+Inherited from ex-kit-v3.1.0:
+  - _trunc() multi-line preservation
+  - ## Recent Exchanges rolling tail (N=4 substantive turns, 2000 chars/msg)
+  - _SUBSTANTIVE_MIN_CHARS=300 gate (trivial turns don't overwrite tail)
+  - Backwards-compat with v3.0 handoffs (legacy tiered-JSON fallback)
 
-v1.0 → v1.1 (preserved):
-  - shell tool path extraction (terminal, execute_code, shell, bash)
-  - session_path resolution
+Changed vs ex-kit-v3.1.0:
+  - Env var cascade now accepts HERMES_* canonical names with HMK_*/legacy
+    fallback. logger.warning() once per legacy var matched. NO DeprecationWarning
+    (Python filters those by default in runtime).
+  - Bases (HERMES_HOME, HERMES_AGENT_MEMORY_BASE) included in cascade so users
+    can configure with 2 env vars instead of 6.
+
+Env vars supported (canonical first, legacy after, base-derived last):
+
+    Direct paths:
+        HERMES_HANDOFF_PATH        || HMK_DIALOGUE_HANDOFF_PATH
+        HERMES_ALWAYS_CONTEXT_PATH || HMK_ALWAYS_CONTEXT_PATH
+        HERMES_SESSIONS_DIR        || HMK_SESSIONS_DIR
+
+    Bases (used to derive direct paths if those are not set):
+        HERMES_AGENT_MEMORY_BASE   || AGENT_MEMORY_BASE / HMK_AGENT_MEMORY_BASE / HMK_BASE_DIR
+        HERMES_HOME                || HMK_HERMES_HOME
+
+    Derivation rules:
+        HANDOFF_PATH         := <agent_memory_base>/state/DIALOGUE-HANDOFF.md
+        ALWAYS_CONTEXT_PATH  := <agent_memory_base>/state/ALWAYS-CONTEXT.md
+        SESSIONS_DIR         := <hermes_home>/sessions
+
+If neither direct path nor base is set, the plugin disables itself (no-op
+hooks) and logs an error explaining what to set.
 """
 from __future__ import annotations
 
@@ -44,29 +57,60 @@ logger = logging.getLogger(__name__)
 
 # --- paths -----------------------------------------------------------
 #
-# v3.0: NO hardcoded fallbacks. Plugin disables itself if env is not set.
+# Cascade: HERMES_* canonical || legacy fallback || base-derived.
+# logger.warning() once per legacy var matched (visible in gateway logs;
+# Python's DeprecationWarning is filtered by default in runtime).
 
-def _resolve_path(keys: List[str]) -> Optional[Path]:
-    for k in keys:
+_legacy_warned: set = set()
+
+
+def _log_legacy_once(legacy_var: str, canonical_var: str) -> None:
+    if legacy_var in _legacy_warned:
+        return
+    _legacy_warned.add(legacy_var)
+    logger.warning(
+        "continuity-plugin: using legacy env var %s (canonical: %s). "
+        "Legacy fallback removal planned for plugin v2.0.",
+        legacy_var,
+        canonical_var,
+    )
+
+
+def _resolve_path(keys: List[str], canonical_idx: int = 0) -> Optional[Path]:
+    """Resolve the first env var set in `keys`. If the matched key is at
+    index > canonical_idx (i.e. legacy), warn once via logger."""
+    for i, k in enumerate(keys):
         v = os.environ.get(k)
         if v:
+            if i > canonical_idx:
+                _log_legacy_once(k, keys[canonical_idx])
             return Path(v).expanduser()
     return None
 
 
-_AGENT_MEMORY_BASE = _resolve_path(["HMK_AGENT_MEMORY_BASE", "AGENT_MEMORY_BASE", "HMK_BASE_DIR"])
-_HERMES_HOME = _resolve_path(["HMK_HERMES_HOME", "HERMES_HOME"])
+# Bases (canonical first, legacy after)
+_AGENT_MEMORY_BASE = _resolve_path([
+    "HERMES_AGENT_MEMORY_BASE",   # canonical
+    "AGENT_MEMORY_BASE",           # legacy generic (no HMK_ prefix)
+    "HMK_AGENT_MEMORY_BASE",       # legacy kit
+    "HMK_BASE_DIR",                # legacy kit alternate
+])
+_HERMES_HOME = _resolve_path([
+    "HERMES_HOME",                 # canonical (Hermes Agent reads this directly)
+    "HMK_HERMES_HOME",             # legacy kit
+])
 
+# Direct paths (canonical, legacy, then derive from base)
 _HANDOFF_PATH = (
-    _resolve_path(["HMK_DIALOGUE_HANDOFF_PATH"])
+    _resolve_path(["HERMES_HANDOFF_PATH", "HMK_DIALOGUE_HANDOFF_PATH"])
     or (_AGENT_MEMORY_BASE / "state" / "DIALOGUE-HANDOFF.md" if _AGENT_MEMORY_BASE else None)
 )
 _ALWAYS_CONTEXT_PATH = (
-    _resolve_path(["HMK_ALWAYS_CONTEXT_PATH"])
+    _resolve_path(["HERMES_ALWAYS_CONTEXT_PATH", "HMK_ALWAYS_CONTEXT_PATH"])
     or (_AGENT_MEMORY_BASE / "state" / "ALWAYS-CONTEXT.md" if _AGENT_MEMORY_BASE else None)
 )
 _SESSIONS_DIR = (
-    _resolve_path(["HMK_SESSIONS_DIR"])
+    _resolve_path(["HERMES_SESSIONS_DIR", "HMK_SESSIONS_DIR"])
     or (_HERMES_HOME / "sessions" if _HERMES_HOME else None)
 )
 
@@ -74,15 +118,16 @@ _CONFIG_OK = all([_HANDOFF_PATH, _ALWAYS_CONTEXT_PATH, _SESSIONS_DIR])
 if not _CONFIG_OK:
     missing = []
     if not _HANDOFF_PATH:
-        missing.append("HMK_DIALOGUE_HANDOFF_PATH (or HMK_AGENT_MEMORY_BASE)")
+        missing.append("HERMES_HANDOFF_PATH (or HERMES_AGENT_MEMORY_BASE)")
     if not _ALWAYS_CONTEXT_PATH:
-        missing.append("HMK_ALWAYS_CONTEXT_PATH (or HMK_AGENT_MEMORY_BASE)")
+        missing.append("HERMES_ALWAYS_CONTEXT_PATH (or HERMES_AGENT_MEMORY_BASE)")
     if not _SESSIONS_DIR:
-        missing.append("HMK_SESSIONS_DIR (or HMK_HERMES_HOME)")
+        missing.append("HERMES_SESSIONS_DIR (or HERMES_HOME)")
     logger.error(
-        "dialogue-handoff v3.1: plugin DISABLED — missing env: %s. "
+        "continuity-plugin v1.0.0: plugin DISABLED — missing env: %s. "
         "The plugin will not read or write any handoff/always-context file. "
-        "Set the above vars in the agent's .env (see hermes-memory-kit v3 docs).",
+        "Legacy HMK_* names are accepted as fallback. See README of "
+        "hermes-continuity-plugin for the full env var cascade.",
         ", ".join(missing),
     )
 
