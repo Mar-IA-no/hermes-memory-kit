@@ -125,7 +125,66 @@ DEFAULT_SHELVES = {
     "episodes": "Chronological log and episodic memory",
     "library": "Distilled notes and reusable knowledge",
     "evidence": "Source documents, reports, and raw traces",
+    # Minecraft-scoped shelves (v3.5+) — kept disjoint from the general
+    # shelves so retrieval can filter by --shelf without contaminating
+    # CLI/Telegram conversation memory with in-game noise.
+    "mc-episodic": "Minecraft world events: what happened, who did what, when",
+    "mc-social": "Minecraft social facts about other players/bots (alliances, conflicts, preferences)",
+    "mc-skills": "Minecraft skills, playbooks, recipes, and patterns learned in-game",
+    "mc-places": "Minecraft notable locations: base, mine, farm, danger zones, marks",
 }
+
+
+def _parse_csv(value):
+    """Parse a CSV string into a list of trimmed non-empty strings.
+    Accepts None, empty string, list, or already-parsed list."""
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [s.strip() for s in str(value).split(",") if s.strip()]
+
+
+def _filter_clauses_and_params(shelves=None, exclude_shelves=None,
+                               tags=None, exclude_tags=None,
+                               shelf_table_alias="s", chapter_table_alias="c"):
+    """Build SQL WHERE clauses and params for shelf/tag filters.
+
+    Args expected as list/CSV-string. Returns (clauses_list, params_list).
+    Empty inputs → empty clauses/params (no filter applied).
+
+    Tag filter uses JSON1 (json_each on tags_json) for exact-match against
+    individual tag values — NOT substring LIKE on the JSON blob (which would
+    falsely match e.g. 'mc' inside 'mcp')."""
+    clauses = []
+    params = []
+    sh_in = _parse_csv(shelves)
+    sh_out = _parse_csv(exclude_shelves)
+    tg_in = _parse_csv(tags)
+    tg_out = _parse_csv(exclude_tags)
+    if sh_in:
+        placeholders = ",".join("?" * len(sh_in))
+        clauses.append(f"{shelf_table_alias}.name IN ({placeholders})")
+        params.extend(sh_in)
+    if sh_out:
+        placeholders = ",".join("?" * len(sh_out))
+        clauses.append(f"{shelf_table_alias}.name NOT IN ({placeholders})")
+        params.extend(sh_out)
+    if tg_in:
+        placeholders = ",".join("?" * len(tg_in))
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM json_each({chapter_table_alias}.tags_json) "
+            f"WHERE value IN ({placeholders}))"
+        )
+        params.extend(tg_in)
+    if tg_out:
+        placeholders = ",".join("?" * len(tg_out))
+        clauses.append(
+            f"NOT EXISTS (SELECT 1 FROM json_each({chapter_table_alias}.tags_json) "
+            f"WHERE value IN ({placeholders}))"
+        )
+        params.extend(tg_out)
+    return clauses, params
 
 BOOTSTRAP_DOCS_ENV = os.environ.get("HMK_BOOTSTRAP_DOCS_JSON", "").strip()
 
@@ -911,12 +970,18 @@ def overlap_ratio(a, b):
     return len(ta & tb) / max(1, len(ta | tb))
 
 
-def search(query, limit=12):
+def search(query, limit=12, shelves=None, exclude_shelves=None,
+           tags=None, exclude_tags=None):
     init_db()
     con = connect()
     q = fts_query_string(query)
+    extra_clauses, extra_params = _filter_clauses_and_params(
+        shelves=shelves, exclude_shelves=exclude_shelves,
+        tags=tags, exclude_tags=exclude_tags,
+    )
+    extra_sql = (" AND " + " AND ".join(extra_clauses)) if extra_clauses else ""
     rows = con.execute(
-        """
+        f"""
         SELECT
           c.id,
           c.book_id,
@@ -938,10 +1003,10 @@ def search(query, limit=12):
         JOIN chapters c ON c.id = chapters_fts.rowid
         JOIN books b ON b.id = c.book_id
         JOIN shelves s ON s.id = b.shelf_id
-        WHERE chapters_fts MATCH ?
+        WHERE chapters_fts MATCH ?{extra_sql}
         LIMIT ?
         """,
-        (q, limit * 3),
+        (q, *extra_params, limit * 3),
     ).fetchall()
     con.close()
     scored = score_candidates(rows, query)
@@ -1040,7 +1105,8 @@ def backfill_embeddings(provider=None, model=None, batch_size=8, limit=0, only_m
     return {"processed": processed, "provider": provider, "model": model}
 
 
-def semantic_search(query, limit=8, provider=None, model=None, use_binary=None):
+def semantic_search(query, limit=8, provider=None, model=None, use_binary=None,
+                    shelves=None, exclude_shelves=None, tags=None, exclude_tags=None):
     """Semantic search via embeddings.
 
     If use_binary is True (default when binary embeddings exist), does a two-pass:
@@ -1064,9 +1130,14 @@ def semantic_search(query, limit=8, provider=None, model=None, use_binary=None):
         model=model,
         output_dimensionality=output_dimensionality,
     )[0]
+    _sem_extra_clauses, _sem_extra_params = _filter_clauses_and_params(
+        shelves=shelves, exclude_shelves=exclude_shelves,
+        tags=tags, exclude_tags=exclude_tags,
+    )
+    _sem_extra_sql = (" AND " + " AND ".join(_sem_extra_clauses)) if _sem_extra_clauses else ""
     con = connect()
     rows = con.execute(
-        """
+        f"""
         SELECT
           c.id,
           c.book_id,
@@ -1090,9 +1161,9 @@ def semantic_search(query, limit=8, provider=None, model=None, use_binary=None):
         JOIN chapters c ON c.id = e.chapter_id
         JOIN books b ON b.id = c.book_id
         JOIN shelves s ON s.id = b.shelf_id
-        WHERE e.provider = ? AND e.model = ?
+        WHERE e.provider = ? AND e.model = ?{_sem_extra_sql}
         """,
-        (provider, model),
+        (provider, model, *_sem_extra_params),
     ).fetchall()
     con.close()
     if not rows:
@@ -1125,8 +1196,11 @@ def semantic_search(query, limit=8, provider=None, model=None, use_binary=None):
     return scored[:limit]
 
 
-def pack(query, budget_tokens=4000, limit=8, threshold=0.60):
-    candidates = search(query, limit=limit * 2)
+def pack(query, budget_tokens=4000, limit=8, threshold=0.60,
+         shelves=None, exclude_shelves=None, tags=None, exclude_tags=None):
+    candidates = search(query, limit=limit * 2,
+                        shelves=shelves, exclude_shelves=exclude_shelves,
+                        tags=tags, exclude_tags=exclude_tags)
     if not candidates or candidates[0]["score"] < threshold:
         result = {
             "query": query,
@@ -1185,12 +1259,17 @@ def pack(query, budget_tokens=4000, limit=8, threshold=0.60):
     return result
 
 
-def hybrid_pack(query, budget_tokens=4000, limit=8, threshold=0.40, provider=None, model=None):
+def hybrid_pack(query, budget_tokens=4000, limit=8, threshold=0.40, provider=None, model=None,
+                shelves=None, exclude_shelves=None, tags=None, exclude_tags=None):
     cfg = embeddings_runtime_config(provider=provider, model=model)
     provider = cfg["provider"]
     model = cfg["model"]
-    lexical = search(query, limit=limit * 2)
-    semantic = semantic_search(query, limit=limit * 2, provider=provider, model=model)
+    lexical = search(query, limit=limit * 2,
+                     shelves=shelves, exclude_shelves=exclude_shelves,
+                     tags=tags, exclude_tags=exclude_tags)
+    semantic = semantic_search(query, limit=limit * 2, provider=provider, model=model,
+                               shelves=shelves, exclude_shelves=exclude_shelves,
+                               tags=tags, exclude_tags=exclude_tags)
     merged = {}
     for row in lexical:
         merged[row["id"]] = dict(row)
@@ -1640,15 +1719,25 @@ def main():
     p_add_file.add_argument("--tags", default="")
     p_add_file.add_argument("--importance", type=float, default=0.5)
 
+    def _add_filter_args(p):
+        """Add --shelf/--exclude-shelf/--tag/--exclude-tag (CSV) to a subparser.
+        Used on retrieval commands. Default empty = no filter (back-compat)."""
+        p.add_argument("--shelf", default="", help="CSV of shelves to include (e.g. plans,evidence,mc-episodic)")
+        p.add_argument("--exclude-shelf", default="", help="CSV of shelves to exclude")
+        p.add_argument("--tag", default="", help="CSV of tags to require (any-match via JSON1 json_each)")
+        p.add_argument("--exclude-tag", default="", help="CSV of tags to exclude")
+
     p_search = sub.add_parser("search")
     p_search.add_argument("--query", required=True)
     p_search.add_argument("--limit", type=int, default=8)
+    _add_filter_args(p_search)
 
     p_pack = sub.add_parser("pack")
     p_pack.add_argument("--query", required=True)
     p_pack.add_argument("--budget", type=int, default=4000)
     p_pack.add_argument("--limit", type=int, default=8)
     p_pack.add_argument("--threshold", type=float, default=0.60)
+    _add_filter_args(p_pack)
 
     p_expand = sub.add_parser("expand")
     p_expand.add_argument("--id", type=int, required=True)
@@ -1672,6 +1761,7 @@ def main():
     p_sem.add_argument("--limit", type=int, default=8)
     p_sem.add_argument("--provider", default=default_embed_provider())
     p_sem.add_argument("--model")
+    _add_filter_args(p_sem)
 
     p_hybrid = sub.add_parser("hybrid-pack")
     p_hybrid.add_argument("--query", required=True)
@@ -1680,6 +1770,7 @@ def main():
     p_hybrid.add_argument("--threshold", type=float, default=0.40)
     p_hybrid.add_argument("--provider", default=default_embed_provider())
     p_hybrid.add_argument("--model")
+    _add_filter_args(p_hybrid)
 
     sub.add_parser("doctor", help="audit HERMES_HOME/plugins/ for sibling collisions + suspect suffixes")
 
@@ -1714,9 +1805,17 @@ def main():
         )
         print(json.dumps({"ok": True, "chapter_id": cid}, indent=2))
     elif args.command == "search":
-        print(json.dumps(search(args.query, limit=args.limit), indent=2))
+        print(json.dumps(search(
+            args.query, limit=args.limit,
+            shelves=args.shelf, exclude_shelves=args.exclude_shelf,
+            tags=args.tag, exclude_tags=args.exclude_tag,
+        ), indent=2))
     elif args.command == "pack":
-        print(json.dumps(pack(args.query, budget_tokens=args.budget, limit=args.limit, threshold=args.threshold), indent=2))
+        print(json.dumps(pack(
+            args.query, budget_tokens=args.budget, limit=args.limit, threshold=args.threshold,
+            shelves=args.shelf, exclude_shelves=args.exclude_shelf,
+            tags=args.tag, exclude_tags=args.exclude_tag,
+        ), indent=2))
     elif args.command == "expand":
         print(json.dumps(expand(args.id), indent=2))
     elif args.command == "link":
@@ -1732,7 +1831,11 @@ def main():
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
     elif args.command == "semantic-search":
-        print(json.dumps(semantic_search(args.query, limit=args.limit, provider=args.provider, model=args.model), indent=2, ensure_ascii=False))
+        print(json.dumps(semantic_search(
+            args.query, limit=args.limit, provider=args.provider, model=args.model,
+            shelves=args.shelf, exclude_shelves=args.exclude_shelf,
+            tags=args.tag, exclude_tags=args.exclude_tag,
+        ), indent=2, ensure_ascii=False))
     elif args.command == "hybrid-pack":
         print(
             json.dumps(
@@ -1743,6 +1846,10 @@ def main():
                     threshold=args.threshold,
                     provider=args.provider,
                     model=args.model,
+                    shelves=args.shelf,
+                    exclude_shelves=args.exclude_shelf,
+                    tags=args.tag,
+                    exclude_tags=args.exclude_tag,
                 ),
                 indent=2,
                 ensure_ascii=False,
