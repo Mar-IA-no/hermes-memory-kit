@@ -127,15 +127,24 @@ fi
 # -------- include paths -------------------------------------------------
 
 INCLUDE_PATHS=(
-  # Systemd user units — both legacy and v3.0 template
+  # Systemd user units — both legacy and v3.0 template + Minecraft services
   /home/onairam/.config/systemd/user/hermes-gateway.service
   /home/onairam/.config/systemd/user/hermes-gateway@.service
-  # User shell config + hermes CLI wrappers
+  /home/onairam/.config/systemd/user/mc-runtime.service
+  /home/onairam/.config/systemd/user/mineflayer-onaiclaw.service
+  /home/onairam/.config/systemd/user/papermc.service
+  # User shell config + hermes CLI wrappers + mc wrapper
   /home/onairam/.bashrc
   /home/onairam/.profile
   /home/onairam/.local/bin/hermes
   /home/onairam/.local/bin/hermes-acp
   /home/onairam/.local/bin/hermes-agent
+  /home/onairam/.local/bin/mc
+  # OnaiClaw identity documents (outside agents/)
+  /home/onairam/.hermes
+  /home/onairam/EMBODIMENT.md
+  # SSH keys (if they exist)
+  /home/onairam/.ssh
   # Legacy root install (while it still exists; kept for rollback)
   /root/.hermes
   /root/.ssh/authorized_keys
@@ -150,6 +159,8 @@ INCLUDE_PATHS=(
   # Reports and user data
   /home/onairam/Escritorio/onaiclaw-reports
   /home/onairam/Documentos
+  # Minecraft — OnaiClaw's body in the game world
+  /home/onairam/minecraft
   # Obsidian wrappers + installer
   /home/onairam/.local/bin/obsidian
   /home/onairam/.local/bin/obsidian-wiki
@@ -242,6 +253,15 @@ if [[ -n "$ONAIRAM_UID" ]]; then
   sudo -u onairam XDG_RUNTIME_DIR="/run/user/$ONAIRAM_UID" \
     systemctl --user cat 'hermes-gateway@*' \
     > "$META/hermes-gateway.user.template.unit.txt" 2>/dev/null || true
+  # Minecraft services
+  for svc in papermc mineflayer-onaiclaw mc-runtime; do
+    sudo -u onairam XDG_RUNTIME_DIR="/run/user/$ONAIRAM_UID" \
+      systemctl --user status "$svc.service" --no-pager \
+      > "$META/$svc.user.status.txt" 2>/dev/null || true
+    sudo -u onairam XDG_RUNTIME_DIR="/run/user/$ONAIRAM_UID" \
+      systemctl --user cat "$svc.service" \
+      > "$META/$svc.user.unit.txt" 2>/dev/null || true
+  done
 fi
 
 python3 --version > "$META/python-version.txt" 2>/dev/null || true
@@ -298,7 +318,12 @@ Restore rápido:
    sudo -iu onairam XDG_RUNTIME_DIR=/run/user/\$(id -u onairam) \\
      systemctl --user enable --now hermes-gateway@hermes-prime.service
 
-7. Verificá:
+7. Reiniciá los servicios de Minecraft:
+
+   sudo -iu onairam XDG_RUNTIME_DIR=/run/user/\$(id -u onairam) \\
+     systemctl --user enable --now papermc mineflayer-onaiclaw mc-runtime
+
+8. Verificá:
 
    sudo -iu onairam XDG_RUNTIME_DIR=/run/user/\$(id -u onairam) \\
      systemctl --user status hermes-gateway@hermes-prime.service --no-pager
@@ -307,6 +332,10 @@ Restore rápido:
    /home/onairam/agents/hermes-prime/scripts/hmk memoryctl.py stats
    # Memoria (v2 legacy):
    python3 /home/onairam/agent-memory/memoryctl.py stats
+
+   # Minecraft:
+   sudo -iu onairam XDG_RUNTIME_DIR=/run/user/\$(id -u onairam) \\
+     systemctl --user status papermc mineflayer-onaiclaw mc-runtime --no-pager
 
 Notas:
 - Este backup incluye secretos y credenciales locales.
@@ -317,6 +346,8 @@ Notas:
 - Si el host ya migró a v3 (agents/<name>/agent-memory/ presente), las rutas
   v2 (/home/onairam/agent-memory, /home/onairam/wiki) no se van a encontrar;
   es esperado.
+- Minecraft world y bot data se restauran en /home/onairam/minecraft/
+- ~/.hermes contiene SOUL.md y logs de identidad
 EOF
 
 # -------- rsync main tree ----------------------------------------------
