@@ -147,6 +147,7 @@ def _parse_csv(value):
 
 def _filter_clauses_and_params(shelves=None, exclude_shelves=None,
                                tags=None, exclude_tags=None,
+                               engram_types=None,
                                shelf_table_alias="s", chapter_table_alias="c"):
     """Build SQL WHERE clauses and params for shelf/tag filters.
 
@@ -184,6 +185,11 @@ def _filter_clauses_and_params(shelves=None, exclude_shelves=None,
             f"WHERE value IN ({placeholders}))"
         )
         params.extend(tg_out)
+    et_in = _parse_csv(engram_types)
+    if et_in:
+        placeholders = ",".join("?" * len(et_in))
+        clauses.append(f"{chapter_table_alias}.engram_type IN ({placeholders})")
+        params.extend(et_in)
     return clauses, params
 
 BOOTSTRAP_DOCS_ENV = os.environ.get("HMK_BOOTSTRAP_DOCS_JSON", "").strip()
@@ -971,13 +977,14 @@ def overlap_ratio(a, b):
 
 
 def search(query, limit=12, shelves=None, exclude_shelves=None,
-           tags=None, exclude_tags=None):
+           tags=None, exclude_tags=None, engram_types=None):
     init_db()
     con = connect()
     q = fts_query_string(query)
     extra_clauses, extra_params = _filter_clauses_and_params(
         shelves=shelves, exclude_shelves=exclude_shelves,
         tags=tags, exclude_tags=exclude_tags,
+        engram_types=engram_types,
     )
     extra_sql = (" AND " + " AND ".join(extra_clauses)) if extra_clauses else ""
     rows = con.execute(
@@ -1106,7 +1113,7 @@ def backfill_embeddings(provider=None, model=None, batch_size=8, limit=0, only_m
 
 
 def semantic_search(query, limit=8, provider=None, model=None, use_binary=None,
-                    shelves=None, exclude_shelves=None, tags=None, exclude_tags=None):
+                    shelves=None, exclude_shelves=None, tags=None, exclude_tags=None, engram_types=None):
     """Semantic search via embeddings.
 
     If use_binary is True (default when binary embeddings exist), does a two-pass:
@@ -1133,6 +1140,7 @@ def semantic_search(query, limit=8, provider=None, model=None, use_binary=None,
     _sem_extra_clauses, _sem_extra_params = _filter_clauses_and_params(
         shelves=shelves, exclude_shelves=exclude_shelves,
         tags=tags, exclude_tags=exclude_tags,
+        engram_types=engram_types,
     )
     _sem_extra_sql = (" AND " + " AND ".join(_sem_extra_clauses)) if _sem_extra_clauses else ""
     con = connect()
@@ -1260,16 +1268,19 @@ def pack(query, budget_tokens=4000, limit=8, threshold=0.60,
 
 
 def hybrid_pack(query, budget_tokens=4000, limit=8, threshold=0.40, provider=None, model=None,
-                shelves=None, exclude_shelves=None, tags=None, exclude_tags=None):
+                shelves=None, exclude_shelves=None, tags=None, exclude_tags=None,
+                engram_types=None):
     cfg = embeddings_runtime_config(provider=provider, model=model)
     provider = cfg["provider"]
     model = cfg["model"]
     lexical = search(query, limit=limit * 2,
                      shelves=shelves, exclude_shelves=exclude_shelves,
-                     tags=tags, exclude_tags=exclude_tags)
+                     tags=tags, exclude_tags=exclude_tags,
+                     engram_types=engram_types)
     semantic = semantic_search(query, limit=limit * 2, provider=provider, model=model,
                                shelves=shelves, exclude_shelves=exclude_shelves,
-                               tags=tags, exclude_tags=exclude_tags)
+                               tags=tags, exclude_tags=exclude_tags,
+                               engram_types=engram_types)
     merged = {}
     for row in lexical:
         merged[row["id"]] = dict(row)
@@ -1394,6 +1405,103 @@ def hybrid_pack(query, budget_tokens=4000, limit=8, threshold=0.40, provider=Non
     }
     log_query(query, budget_tokens, len(items), False, result)
     return result
+
+
+def engram_pack(query, budget_tokens=4000, limit=8, threshold=0.30,
+                provider=None, model=None,
+                shelves=None, exclude_shelves=None,
+                tags=None, exclude_tags=None,
+                quotas=None, k=60):
+    """Reciprocal Rank Fusion (RRF) over the 3 ENGRAM buckets:
+    episodic, semantic, procedural.
+
+    Each bucket is queried independently via hybrid_pack (which already does
+    lexical+semantic+rerank within bucket). Results are then fused using RRF:
+        rrf_score(d) = Σ_b 1 / (k + rank_b(d))
+
+    quotas: dict {episodic: 2, semantic: 4, procedural: 2} — minimum number
+    of items from each bucket BEFORE general RRF ranking. Ensures the prompt
+    always gets a balanced view (no fact-only or no-procedural collapse).
+    """
+    quotas = quotas or {"episodic": 2, "semantic": 4, "procedural": 2}
+    buckets = ["episodic", "semantic", "procedural"]
+
+    # Per-bucket queries
+    bucket_results = {}
+    for et in buckets:
+        try:
+            r = hybrid_pack(query, budget_tokens=budget_tokens, limit=limit * 2,
+                            threshold=0.0,  # don't filter by threshold per-bucket
+                            provider=provider, model=model,
+                            shelves=shelves, exclude_shelves=exclude_shelves,
+                            tags=tags, exclude_tags=exclude_tags,
+                            engram_types=[et])
+            items = r.get("items", []) if isinstance(r, dict) else []
+            bucket_results[et] = items
+        except Exception as e:
+            bucket_results[et] = []
+
+    # RRF scoring across buckets
+    rrf_scores = {}
+    item_lookup = {}
+    for et, items in bucket_results.items():
+        for rank_idx, item in enumerate(items):
+            item_id = item.get("id") or item.get("chapter_id")
+            if item_id is None:
+                continue
+            rrf_scores[item_id] = rrf_scores.get(item_id, 0.0) + 1.0 / (k + rank_idx + 1)
+            if item_id not in item_lookup:
+                item_lookup[item_id] = item
+                item_lookup[item_id]["engram_type"] = et
+
+    # Apply quotas FIRST: take top N from each bucket guaranteed
+    quota_picks = []
+    quota_taken = set()
+    for et in buckets:
+        n_quota = quotas.get(et, 0)
+        for item in bucket_results.get(et, [])[:n_quota]:
+            iid = item.get("id") or item.get("chapter_id")
+            if iid is None or iid in quota_taken:
+                continue
+            quota_picks.append((rrf_scores.get(iid, 0.0), item))
+            quota_taken.add(iid)
+
+    # Then fill remaining slots from RRF ranking
+    remaining = []
+    for iid, score in sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True):
+        if iid in quota_taken:
+            continue
+        if iid in item_lookup:
+            remaining.append((score, item_lookup[iid]))
+
+    # Combine: quota_picks first (in their original RRF order), then remaining
+    quota_picks.sort(key=lambda x: x[0], reverse=True)
+    chosen = []
+    used = 0
+    for score, item in quota_picks + remaining:
+        if score < threshold and len(chosen) > sum(quotas.values()):
+            break
+        cost = token_estimate(item.get("spr", ""))
+        if used + cost > budget_tokens:
+            continue
+        item = dict(item)
+        item["rrf_score"] = round(score, 4)
+        chosen.append(item)
+        used += cost
+        if len(chosen) >= limit:
+            break
+
+    return {
+        "query": query,
+        "engram_pack": True,
+        "rrf_k": k,
+        "quotas": quotas,
+        "buckets_size": {et: len(items) for et, items in bucket_results.items()},
+        "items": chosen,
+        "total_tokens": used,
+        "budget_tokens": budget_tokens,
+        "null_retrieval": len(chosen) == 0,
+    }
 
 
 def sandwich_order(rows):
@@ -1772,6 +1880,19 @@ def main():
     p_hybrid.add_argument("--model")
     _add_filter_args(p_hybrid)
 
+    p_engram = sub.add_parser("engram-pack", help="RRF over episodic+semantic+procedural buckets")
+    p_engram.add_argument("--query", required=True)
+    p_engram.add_argument("--budget", type=int, default=4000)
+    p_engram.add_argument("--limit", type=int, default=8)
+    p_engram.add_argument("--threshold", type=float, default=0.30)
+    p_engram.add_argument("--provider", default=default_embed_provider())
+    p_engram.add_argument("--model")
+    p_engram.add_argument("--rrf-k", type=int, default=60, help="RRF k parameter")
+    p_engram.add_argument("--quota-episodic", type=int, default=2)
+    p_engram.add_argument("--quota-semantic", type=int, default=4)
+    p_engram.add_argument("--quota-procedural", type=int, default=2)
+    _add_filter_args(p_engram)
+
     sub.add_parser("doctor", help="audit HERMES_HOME/plugins/ for sibling collisions + suspect suffixes")
 
     args = parser.parse_args()
@@ -1850,6 +1971,31 @@ def main():
                     exclude_shelves=args.exclude_shelf,
                     tags=args.tag,
                     exclude_tags=args.exclude_tag,
+                ),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    elif args.command == "engram-pack":
+        print(
+            json.dumps(
+                engram_pack(
+                    args.query,
+                    budget_tokens=args.budget,
+                    limit=args.limit,
+                    threshold=args.threshold,
+                    provider=args.provider,
+                    model=args.model,
+                    shelves=args.shelf,
+                    exclude_shelves=args.exclude_shelf,
+                    tags=args.tag,
+                    exclude_tags=args.exclude_tag,
+                    quotas={
+                        "episodic": args.quota_episodic,
+                        "semantic": args.quota_semantic,
+                        "procedural": args.quota_procedural,
+                    },
+                    k=args.rrf_k,
                 ),
                 indent=2,
                 ensure_ascii=False,

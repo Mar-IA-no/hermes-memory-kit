@@ -2,6 +2,60 @@
 
 All notable changes to hermes-memory-kit.
 
+> **Note**: entries for v3.2.0 through v3.5.0 are absent from this file —
+> see `git log` for shelf/tag filters (v3.5.0), CPU-only model2vec stack
+> with binary quantization (v3.4.0), continuity-plugin split (v3.3.0),
+> plugin-backups convention (v3.2.x). Reconstructing those entries here
+> is a separate housekeeping task.
+
+## v3.6.0 — 2026-05-01
+
+### New (ENGRAM taxonomy)
+
+- **`scripts/migrate-engram.py`** — idempotent schema migration that adds
+  `engram_type` (`episodic`/`semantic`/`procedural` with CHECK constraint)
+  plus `event_ts`, `actor`, `location_json` columns to `chapters`, with
+  matching indexes. Backs up the DB to `<db>.bak.preengram.<unix_ts>`
+  before any DDL. Applies a heuristic shelf→engram_type UPDATE pass
+  (e.g. `mc-episodic`, `episodes` → `episodic`; `mc-skills`, `plans` →
+  `procedural`; rest defaults to `semantic`).
+- **`memoryctl.py engram-pack` subcommand** — Reciprocal Rank Fusion
+  retrieval across the three buckets. Runs `hybrid_pack` per
+  `engram_type`, then fuses the ranked lists via
+  `Σ_b 1 / (k + rank_b(d))` with `k=60`. Quotas
+  (`--quota-episodic`, `--quota-semantic`, `--quota-procedural`)
+  guarantee a minimum number of items from each bucket before the
+  remaining prompt budget is filled by RRF ranking. Each returned
+  item carries its source `engram_type` so the caller can render
+  bucket-aware prompt sections.
+- **`engram_types` filter** propagated through `_filter_clauses_and_params`,
+  `search`, `semantic_search`, and `hybrid_pack` for callers that want
+  explicit single-bucket retrieval from the Python API. The CLI does not
+  expose `--engram-type` directly — `engram-pack` is the typed entry point.
+- **`scripts/backfill-semantic.py`** — walks every
+  `engram_type='episodic'` chapter (scoped by `--shelf-pattern`, default
+  `mc-%`), asks Hermes via `hermes chat -q` to extract durable facts in
+  `TYPE | TEXT` format, and inserts the results as new
+  `engram_type='semantic'` chapters under an auto-created
+  `engram-backfill` book in the appropriate shelf. Each new chapter is
+  tagged `engram-backfill`, `<fact_type>`, and `src-chapter-<source_id>`
+  for traceability and easy rollback. Default prompt is generic; set
+  `HMK_AGENT_NAME` and `HMK_DOMAIN_DESC` to specialize, or pass
+  `--prompt-file` for a fully custom template. `--dry-run` prints
+  extracted facts without writing.
+- **`docs/engram.md`** — concept, schema, shelf mapping, RRF formula,
+  CLI usage, backfill workflow, and the few-shot retrieval pattern used
+  by the reference deployment.
+
+### Notes for the reference deployment
+
+- This release ports the live ENGRAM stack from the hermes-prime
+  workspace (where it had been running since the Sprint 3 work on the
+  Minecraft agent project) into the kit so the public repo reflects the
+  shipped behavior. No data migration is required for installs that do
+  not yet use ENGRAM — `engram_type` defaults to `semantic` and the new
+  CLI subcommand is opt-in.
+
 ## v3.1.0 — 2026-04-23
 
 ### Fixed (critical continuity bug)
