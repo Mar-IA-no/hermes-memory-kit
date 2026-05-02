@@ -8,6 +8,76 @@ All notable changes to hermes-memory-kit.
 > plugin-backups convention (v3.2.x). Reconstructing those entries here
 > is a separate housekeeping task.
 
+## v3.7.0 — 2026-05-01
+
+### New (`hmk-memory` MemoryProvider plugin)
+
+- **`templates/plugins/hmk-memory/`** — implementation of Hermes Agent's
+  formal `MemoryProvider` ABC. On every API call Hermes invokes
+  `prefetch(query)` and the returned text is injected into the conversation,
+  giving the LLM long-term memory it doesn't have to ask for. Companion to
+  the existing `dialogue-handoff` working-memory plugin (they live in
+  different planes and coexist).
+- **Retriever**: defaults to `memoryctl.engram_pack` (RRF over episodic /
+  semantic / procedural buckets, with per-bucket quotas). Auto-falls-back
+  to `memoryctl.hybrid_pack` when ENGRAM columns are absent. Configurable
+  via `HMK_PROVIDER_RETRIEVER`.
+- **Render**: items come back as a `## 🧠 Memoria relevante` markdown block
+  with `[engram_type|shelf]` tags when ENGRAM is active and `[shelf]` only
+  when running the hybrid fallback. Each line cites `[mem:N]` for the LLM
+  to use in responses.
+- **`hermes hmk-memory status`** — CLI subcommand (registered only when this
+  is the active provider) that prints DB path, ENGRAM presence, chapter
+  counts per bucket, engram-backfill counts, and effective provider config.
+- **23 pytest cases** in `tests/test_hmk_memory_provider.py` covering name,
+  registration, all `is_available()` variants (no DB, only HMK_DB_PATH set,
+  ENGRAM DB, legacy DB, corrupt DB), `initialize()` (defaults, env
+  overrides, retriever fallback), `prefetch()` (empty query, engram_pack
+  call shape, hybrid_pack fallback, empty items, exception swallowing),
+  `system_prompt_block()` adaptation by retriever, and required no-op
+  methods (`get_tool_schemas`, `handle_tool_call`, `get_config_schema`,
+  `save_config`, `shutdown`). First pytest suite shipped by the kit.
+- **`docs/memory-provider.md`** — concept, two-plane architecture (working
+  vs long-term), activation, env-var contract, single-provider rule,
+  performance characteristics, roadmap.
+
+### Configuration contract
+
+`HMK_AGENT_MEMORY_BASE` (or its legacy aliases `AGENT_MEMORY_BASE` /
+`HMK_BASE_DIR`) is **mandatory** because `memoryctl.connect()` requires
+BASE_DIR to resolve and `sys.exit(2)` otherwise. `HMK_DB_PATH` is documented
+as an override for non-standard layouts; setting only `HMK_DB_PATH` without
+a base is explicitly rejected by `is_available()` to prevent the gateway
+from booting with a provider that would crash on first recall.
+
+### Discovery
+
+Hermes scans `__init__.py` for the strings `MemoryProvider` or
+`register_memory_provider`. `plugin.yaml` carries metadata only and does
+not participate in activation — `config.yaml: memory.provider: hmk-memory`
+is the source of truth.
+
+### Limitations of this MVP (deliberate)
+
+- `sync_turn`, `on_pre_compress`, `get_tool_schemas` are no-ops. Recall is
+  purely pre-emptive via `prefetch`.
+- One external memory provider can be active at a time (Hermes runtime
+  rule). If you have another (`mem0`, `hindsight`, `openviking`, etc.),
+  pick one.
+
+### Notes for the reference deployment
+
+- `bootstrap_agent.py --upgrade` already copies new plugins into existing
+  agents (template path: `templates/plugins/<name>/`).
+- No DB migration needed for installs that don't yet use ENGRAM — the
+  provider's hybrid-pack fallback covers them.
+
+> **Note**: entries for v3.2.0 through v3.5.0 are absent from this file —
+> see `git log` for shelf/tag filters (v3.5.0), CPU-only model2vec stack
+> with binary quantization (v3.4.0), continuity-plugin split (v3.3.0),
+> plugin-backups convention (v3.2.x). Reconstructing those entries here
+> is a separate housekeeping task.
+
 ## v3.6.0 — 2026-05-01
 
 ### New (ENGRAM taxonomy)
