@@ -8,6 +8,50 @@ All notable changes to hermes-memory-kit.
 > plugin-backups convention (v3.2.x). Reconstructing those entries here
 > is a separate housekeeping task.
 
+## v3.7.1 — 2026-05-02
+
+### Fixed (critical, data-loss bug in `bootstrap_agent.py --upgrade`)
+
+- **`bootstrap_agent.py --upgrade` no longer wipes the agent's `scripts/` directory.**
+  The previous behaviour at line ~316 was
+  `copy_tree_overwrite(SCRIPTS_DIR, agent_dir / "scripts", preserve_exec=True)`,
+  and `copy_tree_overwrite()` does
+  `shutil.rmtree(dst)` before copying. That deleted any agent-authored
+  scripts (e.g. `mc_runtime.py`, `agent_state.py`, custom helpers, the
+  whole `.bak` history) on every upgrade with no warning and no recovery
+  path. A real deployment lost ~25 files this way during the v3.7.0
+  rollout to a reference agent (recovered from off-host backup). This
+  release prevents the recurrence.
+- **New helper `copy_tree_merge(src, dst, *, preserve_exec, backup_dir)`**
+  is the merging counterpart to `copy_tree_overwrite`. It walks `src`,
+  copies each file into `dst` (overwriting collisions), and leaves files
+  in `dst` that `src` does not ship untouched. When `backup_dir` is
+  passed, the pre-image of every overwritten file is archived there
+  before being replaced — so a botched upgrade is recoverable from disk.
+- **`upgrade()` now uses `copy_tree_merge`** for `scripts/` and writes
+  the pre-images into `<agent>/script-backups/scripts-merge.<ts>/`.
+  Output now reports `copied=N overwritten=N preserved=N` per upgrade
+  so the operator can see exactly what changed.
+- **`copy_tree_overwrite` docstring** explicitly warns that it destroys
+  the destination, so future callers do not accidentally re-introduce
+  this class of bug. The function is still used for plugins/skills,
+  where rotation is already handled by an explicit
+  `shutil.move(target, plugin-backups/<name>.<ts>.bak)` step before the
+  overwrite — that path was always safe.
+
+### Smoke
+
+A fake agent workspace upgraded with custom files in `scripts/` showed
+`copied=18 overwritten=1 preserved=2`. The custom files came through
+intact and the overwritten kit file was archived under
+`script-backups/scripts-merge.<ts>/`.
+
+> **Note**: entries for v3.2.0 through v3.5.0 are absent from this file —
+> see `git log` for shelf/tag filters (v3.5.0), CPU-only model2vec stack
+> with binary quantization (v3.4.0), continuity-plugin split (v3.3.0),
+> plugin-backups convention (v3.2.x). Reconstructing those entries here
+> is a separate housekeeping task.
+
 ## v3.7.0 — 2026-05-01
 
 ### New (`hmk-memory` MemoryProvider plugin)

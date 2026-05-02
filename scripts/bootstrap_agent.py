@@ -88,6 +88,12 @@ def copy_if_missing(src: Path, dst: Path) -> None:
 
 
 def copy_tree_overwrite(src: Path, dst: Path, preserve_exec: bool = False) -> None:
+    """Replace *dst* with *src* atomically.
+
+    WARNING: this destroys everything in *dst*. Use ``copy_tree_merge`` when
+    *dst* may contain user-authored files alongside kit-shipped ones (e.g.
+    the agent's ``scripts/`` directory).
+    """
     if dst.exists():
         if dst.is_dir():
             shutil.rmtree(dst)
@@ -104,6 +110,68 @@ def copy_tree_overwrite(src: Path, dst: Path, preserve_exec: bool = False) -> No
                     os.chmod(p, 0o755)
                 except Exception:
                     pass
+
+
+def copy_tree_merge(
+    src: Path,
+    dst: Path,
+    *,
+    preserve_exec: bool = False,
+    backup_dir=None,
+):
+    """Copy *src* into *dst*, overwriting colliding files but preserving any
+    files in *dst* that *src* does NOT ship.
+
+    This is the correct semantics for an `--upgrade`: the kit refreshes its
+    own tooling without deleting the agent's custom scripts (mc_runtime.py,
+    domain-specific helpers, ``.bak`` history, etc.). The previous
+    behaviour (``rmtree`` of *dst* before ``copytree``) caused data loss on
+    every upgrade.
+
+    If *backup_dir* is provided, the pre-image of every overwritten file is
+    archived into ``backup_dir/<rel>`` before being replaced. That makes a
+    bad upgrade recoverable from disk without going to off-host backups.
+
+    Returns ``{"copied": N, "overwritten": N, "preserved": N}``.
+    """
+    if not src.is_dir():
+        raise ValueError(f"copy_tree_merge: src must be a directory, got {src}")
+    dst.mkdir(parents=True, exist_ok=True)
+
+    counts = {"copied": 0, "overwritten": 0, "preserved": 0}
+    src_rels = set()
+
+    for src_path in src.rglob("*"):
+        if src_path.is_dir():
+            continue
+        rel = src_path.relative_to(src)
+        src_rels.add(rel)
+        dst_path = dst / rel
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if dst_path.exists():
+            if backup_dir is not None:
+                bak_target = backup_dir / rel
+                bak_target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dst_path, bak_target)
+            counts["overwritten"] += 1
+        else:
+            counts["copied"] += 1
+
+        shutil.copy2(src_path, dst_path)
+        if preserve_exec and (dst_path.suffix == ".sh" or dst_path.name == "hmk"):
+            try:
+                os.chmod(dst_path, 0o755)
+            except Exception:
+                pass
+
+    for dst_path in dst.rglob("*"):
+        if not dst_path.is_file():
+            continue
+        if dst_path.relative_to(dst) not in src_rels:
+            counts["preserved"] += 1
+
+    return counts
 
 
 def render_template(src: Path, dst: Path, values: dict) -> None:
@@ -312,8 +380,32 @@ def upgrade(agent_dir: Path) -> None:
         )
         sys.exit(2)
 
-    # Refresh scripts/ and plugins/ (tooling)
-    copy_tree_overwrite(SCRIPTS_DIR, agent_dir / "scripts", preserve_exec=True)
+    # Refresh scripts/ via MERGE — never wipe agent's custom scripts.
+    # Pre-images of overwritten files are archived in script-backups/ so a
+    # botched upgrade can be reverted without going to off-host backups.
+    import datetime as _dt
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    script_backups_dir = agent_dir / "script-backups" / f"scripts-merge.{ts}"
+    counts = copy_tree_merge(
+        SCRIPTS_DIR,
+        agent_dir / "scripts",
+        preserve_exec=True,
+        backup_dir=script_backups_dir,
+    )
+    if counts["overwritten"] == 0 and counts["copied"] == 0:
+        # Nothing the kit ships changed; clean the empty backup dir.
+        try:
+            shutil.rmtree(script_backups_dir, ignore_errors=True)
+            (agent_dir / "script-backups").rmdir()
+        except OSError:
+            pass
+    else:
+        print(
+            f"  scripts/: copied={counts['copied']} "
+            f"overwritten={counts['overwritten']} "
+            f"preserved={counts['preserved']} "
+            f"(pre-images in script-backups/{script_backups_dir.name}/)"
+        )
     for name_exec in ("hmk", "smoke-test.sh"):
         p = agent_dir / "scripts" / name_exec
         if p.exists():
