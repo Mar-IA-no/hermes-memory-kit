@@ -2,6 +2,8 @@
 
 Self-contained memory infrastructure for Hermes-style agents.
 
+> Latest: [`v3.7.2`](../../releases/tag/v3.7.2) · License: [MIT](LICENSE) · Python 3.10+ · Linux (systemd optional)
+
 This repository exists for a very unglamorous reason: real agents forget at the worst possible moment.
 
 Not in the benchmark sense.
@@ -192,8 +194,9 @@ So the mental model is:
 git clone https://github.com/Mar-IA-no/hermes-memory-kit.git
 cd hermes-memory-kit
 
-# 2. Install Python deps
-pip install -r requirements.txt
+# 2. (Optional) install extras — kit core has zero third-party deps
+pip install -r requirements-ingest.txt           # for scripts/ingest_any.py
+pip install -r requirements-local-embeddings.txt # for CPU-local embeddings
 
 # 3. Create a self-contained agent workspace
 python3 scripts/bootstrap_agent.py ~/agents/hermes-alfa --name hermes-alfa --with-wiki-templates
