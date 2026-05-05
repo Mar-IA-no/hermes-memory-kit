@@ -2,7 +2,10 @@
 
 Self-contained memory infrastructure for Hermes-style agents.
 
-> Latest: [`v3.7.2`](../../releases/tag/v3.7.2) · License: [MIT](LICENSE) · Python 3.10+ · Linux (systemd optional)
+[![release](https://img.shields.io/github/v/tag/Mar-IA-no/hermes-memory-kit?label=release&style=flat&color=blue)](https://github.com/Mar-IA-no/hermes-memory-kit/releases)
+[![license](https://img.shields.io/github/license/Mar-IA-no/hermes-memory-kit?style=flat&color=success)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![hermes-agent](https://img.shields.io/badge/Hermes_Agent-v0.10%2B-9cf?style=flat)](https://github.com/NousResearch/hermes-agent)
 
 This repository exists for a very unglamorous reason: real agents forget at the worst possible moment.
 
@@ -182,6 +185,17 @@ So the mental model is:
 - **canon** for truth,
 - **continuity** for re-entry,
 - **projection** for navigation.
+
+```mermaid
+flowchart LR
+    LLM([Hermes Agent])
+    H([human operator])
+
+    LLM <-->|"memoryctl · hybrid_pack / engram_pack"| DB[("agent-memory/library.db<br/>durable canon")]
+    LLM <-->|"continuity-plugin · pre/post_llm_call"| DH[/"DIALOGUE-HANDOFF.*.md<br/>working memory"/]
+    DB -.->|"export_obsidian.py"| WIKI[/"wiki/<br/>projection (Obsidian)"/]
+    H --> WIKI
+```
 
 ---
 
