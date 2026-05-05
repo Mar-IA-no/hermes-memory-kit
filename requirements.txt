@@ -1,4 +1,11 @@
-beautifulsoup4
-markdownify
-mammoth
-trafilatura
+# hermes-memory-kit core dependencies
+#
+# The kit's core (memoryctl, hmk-memory provider, bootstrap_agent,
+# migrate-engram, dialogue-handoff plugin) has zero third-party deps —
+# only Python stdlib and SQLite, both shipped with Python.
+#
+# Optional extras live in separate files:
+#   - requirements-ingest.txt          → scripts/ingest_any.py (web/docx)
+#   - requirements-local-embeddings.txt → CPU-local embedding provider
+#
+# Install Hermes Agent itself separately (see README "Quick Start").

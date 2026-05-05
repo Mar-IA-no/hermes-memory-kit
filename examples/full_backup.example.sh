@@ -1,3 +1,19 @@
+# ===========================================================================
+# DISCLAIMER: this is an EXAMPLE, NOT a portable script.
+#
+# This is the kit author's actual backup script for a multi-agent layout
+# living under /home/onairam/agents/. Every path below is hardcoded for
+# that environment. Read it for inspiration, then adapt before running
+# on your own host:
+#
+#   - replace `onairam` with your username (or use $USER)
+#   - replace AGENTS_ROOT with your real agents location
+#   - audit the systemd unit list for what actually runs on your host
+#   - the SQLite snapshot logic and tar exclusion rules carry over fine
+#
+# The body below is the verbatim original.
+# ===========================================================================
+
 #!/usr/bin/env bash
 # full_backup.sh — snapshot consistente del deploy de Hermes (multi-agent).
 #

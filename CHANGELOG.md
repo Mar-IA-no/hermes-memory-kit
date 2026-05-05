@@ -1,3 +1,30 @@
+## [3.7.2] — 2026-05-05
+
+Share-readiness hardening so the kit can be cloned and used by colleagues
+without environment-specific surprises. **No functional changes** to
+memoryctl, the hmk-memory provider, or the dialogue-handoff plugin.
+
+### Changed
+
+- `scripts/full_backup.sh` moved to `examples/full_backup.example.sh`. It
+  is the author's personal multi-agent backup with hardcoded
+  `/home/onairam/...` paths and was misleading at the top level of a
+  shareable repo. A disclaimer header is prepended; the body is verbatim.
+- `requirements.txt` split into core (informational, no third-party deps —
+  the kit's core uses only Python stdlib + SQLite) and a new
+  `requirements-ingest.txt` for the optional `scripts/ingest_any.py`
+  multi-format ingestion (beautifulsoup4, markdownify, mammoth,
+  trafilatura). `requirements-local-embeddings.txt` keeps CPU-local
+  embedding extras separate.
+- `ISSUE-plugin-backup-collision.md` moved out of the repo root into
+  `docs/known-issues/plugin-backup-collision.md`. It is a known-issue
+  write-up, not a top-level concern.
+
+### Added
+
+- Version tags (`v3.6.0`, `v3.7.0`, `v3.7.1`, `v3.7.2`) so colleagues can
+  pin to a specific release. The repo previously had no tags.
+
 # Changelog
 
 All notable changes to hermes-memory-kit.

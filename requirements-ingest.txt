@@ -1,0 +1,9 @@
+# Optional dependencies for scripts/ingest_any.py — multi-format
+# document ingestion (HTML, PDF via pdftotext, DOCX, EPUB via pandoc).
+#
+# Install only if you plan to run ingest_any.py:
+#   pip install -r requirements-ingest.txt
+beautifulsoup4
+markdownify
+mammoth
+trafilatura
