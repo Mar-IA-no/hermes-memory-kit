@@ -7,7 +7,7 @@ license: MIT
 metadata:
   hermes:
     tags: [Memory, Librarian, Retrieval, SQLite, FTS5, Local]
-    related_skills: [codebase-inspection]
+    related_skills: [codebase-inspection, library-acquisition]
 prerequisites:
   commands: [python3]
 ---
@@ -171,6 +171,17 @@ Paths relative to the agent workspace root:
 - `agent-memory/library.db`
 - `wiki/index.md`
 - `wiki/maps/project-memory-system.md`
+
+### Third tier — the Research Library (primary-source corpus)
+
+Beyond memory (`library.db`) and the wiki map, an agent may keep a **Research
+Library**: a filesystem corpus of full primary sources (books, papers) under
+`$LIBRARY_ROOT` (default `$HMK_WORKSPACE_ROOT/library`), citable as *(Author,
+Year, ch. X, p. Y)*. It is acquired and curated via the `library-acquisition`
+skill, which registers a catalog pointer (shelf `evidence`) back into
+`library.db` for each book — so `hybrid-pack`/`search` surface corpus books and
+`expand` jumps to the on-disk chapter. `library.db` holds the **index**; the
+Research Library holds the **full text**. Do not confuse the two "libraries".
 
 ## Retrieval Strategy
 
