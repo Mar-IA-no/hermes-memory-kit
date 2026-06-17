@@ -247,14 +247,21 @@ def test_system_prompt_block_hybrid_mode(
 
 # ---- required no-op methods ------------------------------------------------
 
-def test_get_tool_schemas_empty(provider_module):
-    assert provider_module.HMKMemoryProvider().get_tool_schemas() == []
+def test_get_tool_schemas_exposes_remember_recall(provider_module):
+    schemas = provider_module.HMKMemoryProvider().get_tool_schemas()
+    names = [s["name"] for s in schemas]
+    assert names == ["remember", "recall"]
+    # flat schema shape the MemoryManager indexes (top-level name + parameters,
+    # NOT the OpenAI-nested {"type":"function",...} form which would be dropped)
+    assert all("parameters" in s and "type" not in s for s in schemas)
 
 
-def test_handle_tool_call_raises_not_implemented(provider_module):
+def test_handle_tool_call_unknown_tool_returns_error(provider_module):
+    # tools are exposed now (remember/recall); an unknown tool returns a
+    # graceful error string rather than raising.
     p = provider_module.HMKMemoryProvider()
-    with pytest.raises(NotImplementedError):
-        p.handle_tool_call("anything", {})
+    result = p.handle_tool_call("anything", {})
+    assert isinstance(result, str) and "ERROR" in result
 
 
 def test_get_config_schema_empty_for_env_var_only(provider_module):

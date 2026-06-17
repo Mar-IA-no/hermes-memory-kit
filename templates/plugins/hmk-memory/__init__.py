@@ -8,6 +8,12 @@ procedural buckets) or, as a fallback when the DB does not yet have the
 ENGRAM schema applied, ``memoryctl.hybrid_pack`` — and returns the result as
 a markdown bullet list.
 
+In addition to per-turn ``prefetch`` recall, this provider now exposes the
+``remember`` / ``recall`` tools (deliberate write/read of library.db) and an
+``on_session_end`` hook that distills the closing conversation into durable
+chapters via an auxiliary LLM (organic growth), tagging each by the session's
+interlocutor for gateway-independent, per-contact partitioning.
+
 Configuration is env-var-only. See ``README.md`` for the full table.
 """
 from __future__ import annotations
@@ -16,6 +22,7 @@ import importlib
 import importlib.util as iu
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -124,8 +131,28 @@ class HMKMemoryProvider(MemoryProvider):
         # available and falls back to hybrid_pack at initialize time.
         return "id" in cols
 
+    @staticmethod
+    def _slug_interlocutor(*candidates) -> str:
+        # Derive a stable tag from the session's interlocutor (prefer a human
+        # name; fall back to the id with platform suffix stripped). Makes
+        # organic, gateway-independent per-contact partitioning of memory.
+        for v in candidates:
+            if not v or not isinstance(v, str):
+                continue
+            v = v.split("@", 1)[0].strip()
+            if not v:
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "-", v.lower()).strip("-")
+            if slug:
+                return slug[:40]
+        return ""
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        self._interlocutor = self._slug_interlocutor(
+            kwargs.get("chat_name"), kwargs.get("user_name"),
+            kwargs.get("chat_id"), kwargs.get("user_id"),
+        )
         self._hermes_home = (
             kwargs.get("hermes_home")
             or os.environ.get("HERMES_HOME")
@@ -171,11 +198,109 @@ class HMKMemoryProvider(MemoryProvider):
             self._shelves,
         )
 
+    _SHELVES = ["identity", "state", "plans", "episodes", "library", "evidence"]
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return []
+        # FLAT schema format (name/description/parameters at top level) — the
+        # MemoryManager reads schema["name"] directly; an OpenAI-nested
+        # {"type":"function","function":{...}} wrapper makes name="" and the
+        # tool is silently dropped from the routing table.
+        return [
+            {
+                "name": "remember",
+                "description": (
+                    "Save a DURABLE fact to long-term memory (HMK library.db). "
+                    "Use whenever the user asks you to remember something, or when "
+                    "you learn a lasting fact, decision, preference, or person worth "
+                    "keeping across sessions. This is your reliable write path \u2014 it "
+                    "always persists. Do NOT save transient/session-only details."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "The fact, as a self-contained sentence or two."},
+                        "title": {"type": "string", "description": "Short handle/title for this memory."},
+                        "shelf": {"type": "string", "enum": self._SHELVES, "description": "Bucket. Default 'library' (reusable knowledge, people, lessons). 'identity'=who I/the operator am; 'plans'=decisions/roadmap; 'evidence'=source docs; 'state'=current operating state; 'episodes'=chronological log."},
+                        "tags": {"type": "string", "description": "Optional comma-separated tags."},
+                        "importance": {"type": "number", "description": "0-10; default 5. Higher = surfaces more readily."},
+                    },
+                    "required": ["content", "title"],
+                },
+            },
+            {
+                "name": "recall",
+                "description": (
+                    "Explicitly search long-term memory (HMK library.db) for durable "
+                    "facts. Passive recall already runs each turn; use this for a "
+                    "deliberate lookup ('what do I know about X?')."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What to look up."},
+                        "limit": {"type": "integer", "description": "Max items (default 5)."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        raise NotImplementedError("hmk-memory: tools are not exposed in v3.7.0 MVP")
+        try:
+            mc = self._get_memoryctl()
+        except Exception as e:  # pragma: no cover - defensive
+            return "ERROR: memory backend unavailable: %s" % e
+
+        if tool_name == "remember":
+            content = (args.get("content") or "").strip()
+            if not content:
+                return "ERROR: 'content' is required."
+            title = (args.get("title") or content[:60]).strip()
+            shelf = args.get("shelf") or "library"
+            if shelf not in self._SHELVES:
+                shelf = "library"
+            tags = [t.strip() for t in (args.get("tags") or "").split(",") if t.strip()]
+            try:
+                importance = float(args.get("importance", 5.0))
+            except (TypeError, ValueError):
+                importance = 5.0
+            try:
+                # replace=False: never destroy an existing same-title memory.
+                cid = mc.add_text(shelf_name=shelf, title=title, raw=content,
+                                  tags=tags, importance=importance, replace=False)
+            except Exception as e:
+                logger.warning("remember: add_text failed: %s", e)
+                return "ERROR saving to memory: %s" % e
+            embed_note = ""
+            try:
+                mc.backfill_embeddings(only_missing=True)
+            except Exception as e:
+                logger.warning("remember: embed backfill failed (saved, lexical-only): %s", e)
+                embed_note = " (semantic index pending; lexically searchable now)"
+            return "Saved to long-term memory [HMK shelf '%s', id %s] \"%s\".%s" % (
+                shelf, cid, title, embed_note)
+
+        if tool_name == "recall":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "ERROR: 'query' is required."
+            try:
+                limit = int(args.get("limit", 5))
+            except (TypeError, ValueError):
+                limit = 5
+            try:
+                result = mc.hybrid_pack(query=query, budget_tokens=self._budget,
+                                        limit=limit, threshold=self._threshold,
+                                        shelves=self._shelves)
+            except Exception as e:
+                logger.warning("recall: hybrid_pack failed: %s", e)
+                return "ERROR searching memory: %s" % e
+            items = result.get("items", []) if isinstance(result, dict) else []
+            if not items:
+                return "No durable memories found for: %s" % query
+            return self._render_items(items)
+
+        return "ERROR: hmk-memory does not handle tool '%s'." % tool_name
 
     # ---- config (env-var-only, no setup wizard) -----------------------
 
@@ -260,6 +385,174 @@ class HMKMemoryProvider(MemoryProvider):
         if self._memoryctl is None:
             self._memoryctl = _import_memoryctl(hermes_home=self._hermes_home)
         return self._memoryctl
+
+    # ---- organic growth: end-of-session distillation -------------------
+    # When a session expires/resets the gateway calls on_session_end(messages)
+    # with the real transcript. We distill durable novelties into HMK via an
+    # auxiliary-LLM call, OFF the hot path (daemon thread) so we never block
+    # the gateway's session-expiry watcher. Best-effort: failures are logged
+    # and dropped, never raised.
+
+    _DISTILL_SYS = (
+        "You extract DURABLE long-term memories from a conversation transcript "
+        "for an AI agent's knowledge base. Return ONLY a JSON array (possibly "
+        "empty). Each element: {\"shelf\": one of [identity,state,plans,episodes,"
+        "library,evidence], \"title\": short handle, \"content\": 1-3 self-contained "
+        "sentences, \"importance\": 0-10, \"tags\": comma-separated}. "
+        "INCLUDE only lasting facts: decisions, stable user/operator preferences, "
+        "people/relationships, project facts, durable lessons. "
+        "EXCLUDE: transient/session-only details, greetings, the agent's own "
+        "chit-chat, and ANYTHING about security config, secrets, credentials, "
+        "allowlists, or tokens. If nothing durable, return []. shelf guidance: "
+        "library=reusable knowledge/people/lessons; identity=who the agent/operator is; "
+        "plans=decisions/roadmap; evidence=source docs; state=current operating state; "
+        "episodes=notable chronological events."
+    )
+
+    def on_session_end(self, messages):
+        try:
+            if (os.environ.get("HMK_DISTILL_ENABLED", "1").strip().lower()
+                    in ("0", "false", "no", "off")):
+                return
+            if not messages or not isinstance(messages, list):
+                return
+            import threading
+            t = threading.Thread(
+                target=self._run_distill, args=(list(messages),),
+                name="hmk-distill", daemon=True,
+            )
+            t.start()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("hmk-memory on_session_end spawn failed: %s", e)
+
+    @staticmethod
+    def _messages_to_transcript(messages, max_chars=12000):
+        parts = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            c = m.get("content", "")
+            if isinstance(c, list):  # multimodal blocks
+                segs = []
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") in ("text", "input_text"):
+                        segs.append(b.get("text", ""))
+                c = " ".join(segs)
+            if not isinstance(c, str):
+                c = str(c)
+            c = c.strip()
+            if c:
+                parts.append("%s: %s" % (role.upper(), c))
+        text = "\n".join(parts)
+        if len(text) > max_chars:  # keep the tail (most recent) within budget
+            text = text[-max_chars:]
+        return text
+
+    def _run_distill(self, messages):
+        try:
+            min_turns = int(os.environ.get("HMK_DISTILL_MIN_TURNS", "2"))
+            user_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user")
+            if user_turns < min_turns:
+                return
+            transcript = self._messages_to_transcript(messages)
+            if len(transcript) < 200:
+                return
+            cands = self._extract_candidates(transcript)
+            if not cands:
+                logger.info("hmk-distill: no durable novelties extracted")
+                return
+            n = self._persist_candidates(cands)
+            logger.info("hmk-distill: extracted %d candidate(s), persisted %d new", len(cands), n)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("hmk-distill failed: %s", e)
+
+    def _extract_candidates(self, transcript):
+        provider = os.environ.get("HMK_DISTILL_PROVIDER", "kimi-coding")
+        model = os.environ.get("HMK_DISTILL_MODEL", "kimi-k2.7")
+        timeout = float(os.environ.get("HMK_DISTILL_TIMEOUT", "120"))
+        max_facts = int(os.environ.get("HMK_DISTILL_MAX_FACTS", "5"))
+        from agent.auxiliary_client import call_llm
+        resp = call_llm(
+            provider=provider, model=model,
+            messages=[
+                {"role": "system", "content": self._DISTILL_SYS},
+                {"role": "user", "content": "Transcript:\n\n" + transcript},
+            ],
+            temperature=0.2, max_tokens=1400, timeout=timeout,
+        )
+        text = resp.choices[0].message.content if resp and resp.choices else ""
+        if not text:
+            return []
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+        import json as _json
+        try:
+            data = _json.loads(text)
+        except Exception:
+            i, j = text.find("["), text.rfind("]")
+            if i == -1 or j == -1 or j <= i:
+                logger.warning("hmk-distill: could not parse extractor output")
+                return []
+            data = _json.loads(text[i:j + 1])
+        if not isinstance(data, list):
+            return []
+        out = []
+        for d in data[:max_facts]:
+            if not isinstance(d, dict):
+                continue
+            content = (d.get("content") or "").strip()
+            if not content:
+                continue
+            shelf = d.get("shelf") or "library"
+            if shelf not in ("identity", "state", "plans", "episodes", "library", "evidence"):
+                shelf = "library"
+            out.append({
+                "shelf": shelf,
+                "title": (d.get("title") or content[:60]).strip(),
+                "content": content,
+                "importance": float(d.get("importance", 5.0)) if str(d.get("importance", "")).strip() not in ("",) else 5.0,
+                "tags": d.get("tags") or "",
+            })
+        return out
+
+    def _persist_candidates(self, cands):
+        mc = self._get_memoryctl()
+        dedup_thr = float(os.environ.get("HMK_DISTILL_DEDUP_THRESHOLD", "0.82"))
+        added = 0
+        for c in cands:
+            try:
+                dup = mc.hybrid_pack(query=c["content"], budget_tokens=300, limit=1, threshold=0.0)
+                items = dup.get("items", []) if isinstance(dup, dict) else []
+                if items and float(items[0].get("score", 0.0)) >= dedup_thr:
+                    continue
+            except Exception:
+                pass  # dedup is best-effort; fall through to write
+            try:
+                tags = [t.strip() for t in str(c["tags"]).split(",") if t.strip()]
+                tags.append("auto-distilled")
+                _interloc = getattr(self, "_interlocutor", "")
+                if _interloc and _interloc not in tags:
+                    tags.append(_interloc)
+                mc.add_text(shelf_name=c["shelf"], title=c["title"], raw=c["content"],
+                            tags=tags, importance=c["importance"], replace=False)
+                added += 1
+            except Exception as e:
+                logger.warning("hmk-distill: add_text failed: %s", e)
+        if added:
+            try:
+                mc.backfill_embeddings(only_missing=True)
+            except Exception as e:
+                logger.warning("hmk-distill: embed backfill failed: %s", e)
+        return added
 
 
 def register(ctx) -> None:

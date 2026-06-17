@@ -1,3 +1,15 @@
+## [3.8.0] — 2026-06-17
+
+### Added
+- `hmk-memory` provider: **write + organic growth**. Beyond per-turn prefetch
+  recall it now exposes `remember` / `recall` tools (deliberate write/read of
+  `library.db`) and an `on_session_end` distiller that, off the hot path,
+  extracts durable novelties from the closing conversation via an auxiliary LLM
+  and files them as chapters — each tagged by the session's interlocutor, so the
+  library partitions by contact independently of the gateway. Tool schemas use
+  the flat `{name,description,parameters}` shape the MemoryManager indexes.
+  Plugin bumped to 1.1.0.
+
 ## [3.7.3] — 2026-05-09
 
 ### Fixed
