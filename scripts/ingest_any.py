@@ -16,6 +16,11 @@ from markdownify import markdownify as html_to_markdown
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memoryctl
+try:
+    from corpus_policy import should_block_file, classify_source_kind
+except ImportError:
+    should_block_file = None  # type: ignore
+    classify_source_kind = None  # type: ignore
 
 
 TEXT_SUFFIXES = {
@@ -188,6 +193,17 @@ def main():
         print(markdown)
         return
 
+    # v3.9.0 — file-level blocking via corpus policy
+    if not is_url(args.source) and should_block_file:
+        blocked, reason = should_block_file(args.source)
+        if blocked:
+            raise SystemExit(f"ERROR: file blocked by corpus policy: {reason}")
+
+    # v3.9.0 — classify source_kind for selective embedding
+    kind = "url" if is_url(args.source) else "converted-file"
+    if not is_url(args.source) and classify_source_kind:
+        kind = classify_source_kind(args.source)
+
     chapter_id = memoryctl.add_text(
         shelf_name=args.shelf,
         title=args.title or default_title(args.source),
@@ -195,7 +211,7 @@ def main():
         tags=memoryctl.parse_tags(args.tags),
         importance=args.importance,
         source_path=args.source,
-        source_kind="url" if is_url(args.source) else "converted-file",
+        source_kind=kind,
         replace=True,
     )
     print(json.dumps({"ok": True, "chapter_id": chapter_id}))

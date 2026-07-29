@@ -9,11 +9,18 @@ ENGRAM schema applied, ``memoryctl.hybrid_pack`` — and returns the result as
 a markdown bullet list.
 
 Configuration is env-var-only. See ``README.md`` for the full table.
+
+v3.8.0 — exposes the ``librarian`` tool so agents can read and write durable
+knowledge in ``library.db`` without leaving the conversation.
+
+v3.8.1 / plugin 1.1.0 — the ``librarian`` tool gains ``update`` and ``delete``
+actions (backed by ``memoryctl.update_chapter`` / ``delete_chapter``).
 """
 from __future__ import annotations
 
 import importlib
 import importlib.util as iu
+import json
 import logging
 import os
 import sqlite3
@@ -87,6 +94,73 @@ try:
 except Exception:  # pragma: no cover - exercised only outside Hermes
     class MemoryProvider:  # type: ignore
         pass
+
+
+def _parse_csv(value: Any) -> Optional[List[str]]:
+    """Normalize a comma-separated string or list into a list of trimmed values."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        return [s.strip() for s in value.split(",") if s.strip()] or None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Tool schema for the librarian tool
+# ---------------------------------------------------------------------------
+LIBRARIAN_SCHEMA = {
+    "name": "librarian",
+    "description": (
+        "Read, write, and inspect durable knowledge in the local HMK library "
+        "(~/.hermes/agent-memory/library.db). This is the canonical long-term "
+        "memory store: anything saved here survives across sessions and can be "
+        "retrieved later by query or exact chapter id.\n\n"
+        "Actions:\n"
+        "- query: hybrid (lexical + semantic) retrieval. Returns ranked items.\n"
+        "- search: pure lexical FTS search.\n"
+        "- add_text: store a new text chapter under a shelf.\n"
+        "- add_file: ingest a file from disk into a shelf.\n"
+        "- expand: return the full record for a chapter id, including neighbors.\n"
+        "- update: edit a chapter in place (content/title/tags/importance).\n"
+        "- delete: remove a chapter (cascades embeddings/links).\n"
+        "- stats: return library counts and embedding metadata.\n"
+        "- add_link: create a directed link between two chapters.\n\n"
+        "Use this tool instead of SQL scripts or manual memoryctl calls."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["query", "search", "add_text", "add_file", "expand", "update", "delete", "stats", "add_link"],
+                "description": "The librarian action to perform.",
+            },
+            "query": {"type": "string", "description": "Search/query text (required for query/search)."},
+            "shelf": {"type": "string", "description": "Target shelf name (required for add_text/add_file)."},
+            "title": {"type": "string", "description": "Chapter/book title (required for add_text; optional for add_file, defaults to file stem; optional for update)."},
+            "content": {"type": "string", "description": "Raw text content (required for add_text; optional for update)."},
+            "file_path": {"type": "string", "description": "Absolute or relative path to a file (required for add_file)."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of tags to attach to the new chapter.",
+            },
+            "importance": {"type": "number", "description": "Optional importance score (0.0-1.0, default 0.5)."},
+            "limit": {"type": "integer", "description": "Max results for query/search (default 8)."},
+            "threshold": {"type": "number", "description": "Minimum score threshold for query (default 0.4)."},
+            "shelves": {"type": "string", "description": "Comma-separated shelf filter for query/search."},
+            "exclude_shelves": {"type": "string", "description": "Comma-separated shelves to exclude from query/search."},
+            "chapter_id": {"type": "integer", "description": "Chapter id (required for expand/update/delete)."},
+            "source_id": {"type": "integer", "description": "Source chapter id (required for add_link)."},
+            "target_id": {"type": "integer", "description": "Destination chapter id (required for add_link)."},
+            "link_type": {"type": "string", "description": "Link type (default 'related')."},
+            "note": {"type": "string", "description": "Optional note for add_link."},
+        },
+        "required": ["action"],
+    },
+}
 
 
 class HMKMemoryProvider(MemoryProvider):
@@ -172,10 +246,165 @@ class HMKMemoryProvider(MemoryProvider):
         )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return []
+        return [LIBRARIAN_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        raise NotImplementedError("hmk-memory: tools are not exposed in v3.7.0 MVP")
+        if tool_name != "librarian":
+            raise NotImplementedError(f"hmk-memory: tool '{tool_name}' not implemented")
+
+        try:
+            mc = self._get_memoryctl()
+            action = (args.get("action") or "").strip()
+
+            def _get_int(key: str, default: int) -> int:
+                v = args.get(key)
+                return int(v) if v is not None else default
+
+            def _get_float(key: str, default: float) -> float:
+                v = args.get(key)
+                return float(v) if v is not None else default
+
+            if action == "query":
+                query = args.get("query") or ""
+                if not query:
+                    return json.dumps({"success": False, "error": "query is required"}, ensure_ascii=False)
+                limit = _get_int("limit", self._limit)
+                threshold = _get_float("threshold", self._threshold)
+                shelves = _parse_csv(args.get("shelves")) or self._shelves
+                exclude_shelves = _parse_csv(args.get("exclude_shelves"))
+                if self._retriever == "engram_pack":
+                    result = mc.engram_pack(
+                        query=query,
+                        budget_tokens=self._budget,
+                        limit=limit,
+                        threshold=threshold,
+                        shelves=shelves,
+                        exclude_shelves=exclude_shelves,
+                        quotas=self._quotas,
+                    )
+                else:
+                    result = mc.hybrid_pack(
+                        query=query,
+                        budget_tokens=self._budget,
+                        limit=limit,
+                        threshold=threshold,
+                        shelves=shelves,
+                        exclude_shelves=exclude_shelves,
+                    )
+                return json.dumps(result, ensure_ascii=False, default=str)
+
+            if action == "search":
+                query = args.get("query") or ""
+                if not query:
+                    return json.dumps({"success": False, "error": "query is required"}, ensure_ascii=False)
+                limit = _get_int("limit", self._limit)
+                shelves = _parse_csv(args.get("shelves")) or self._shelves
+                exclude_shelves = _parse_csv(args.get("exclude_shelves"))
+                rows = mc.search(
+                    query=query,
+                    limit=limit,
+                    shelves=shelves,
+                    exclude_shelves=exclude_shelves,
+                )
+                return json.dumps({"success": True, "items": rows}, ensure_ascii=False, default=str)
+
+            if action == "add_text":
+                shelf = args.get("shelf") or ""
+                title = args.get("title") or ""
+                content = args.get("content") or ""
+                if not shelf or not title or not content:
+                    return json.dumps({"success": False, "error": "shelf, title, and content are required"}, ensure_ascii=False)
+                tags = _parse_csv(args.get("tags"))
+                importance = _get_float("importance", 0.5)
+                chapter_id = mc.add_text(
+                    shelf_name=shelf,
+                    title=title,
+                    raw=content,
+                    tags=tags,
+                    importance=importance,
+                )
+                return json.dumps({"success": True, "chapter_id": chapter_id, "shelf": shelf, "title": title}, ensure_ascii=False)
+
+            if action == "add_file":
+                shelf = args.get("shelf") or ""
+                file_path = args.get("file_path") or ""
+                if not shelf or not file_path:
+                    return json.dumps({"success": False, "error": "shelf and file_path are required"}, ensure_ascii=False)
+                p = Path(file_path).expanduser()
+                if not p.is_file():
+                    return json.dumps({"success": False, "error": f"file not found: {p}"}, ensure_ascii=False)
+                title = args.get("title") or None
+                tags = _parse_csv(args.get("tags"))
+                importance = _get_float("importance", 0.5)
+                chapter_id = mc.add_file(
+                    path=str(p),
+                    shelf_name=shelf,
+                    title=title,
+                    tags=tags,
+                    importance=importance,
+                )
+                return json.dumps({"success": True, "chapter_id": chapter_id, "shelf": shelf, "file": str(p)}, ensure_ascii=False)
+
+            if action == "expand":
+                chapter_id = args.get("chapter_id")
+                if chapter_id is None:
+                    return json.dumps({"success": False, "error": "chapter_id is required"}, ensure_ascii=False)
+                data = mc.expand(int(chapter_id))
+                return json.dumps({"success": True, "chapter": data}, ensure_ascii=False, default=str)
+
+            if action == "update":
+                chapter_id = args.get("chapter_id")
+                if chapter_id is None:
+                    return json.dumps({"success": False, "error": "chapter_id is required"}, ensure_ascii=False)
+                content = args.get("content")
+                title = args.get("title") or None
+                tags = _parse_csv(args.get("tags"))
+                importance_raw = args.get("importance")
+                importance = float(importance_raw) if importance_raw is not None else None
+                if content is None and title is None and tags is None and importance is None:
+                    return json.dumps(
+                        {"success": False, "error": "nothing to update: pass content, title, tags, and/or importance"},
+                        ensure_ascii=False,
+                    )
+                result = mc.update_chapter(
+                    int(chapter_id),
+                    content=content,
+                    title=title,
+                    tags=tags,
+                    importance=importance,
+                )
+                return json.dumps({"success": True, **result}, ensure_ascii=False, default=str)
+
+            if action == "delete":
+                chapter_id = args.get("chapter_id")
+                if chapter_id is None:
+                    return json.dumps({"success": False, "error": "chapter_id is required"}, ensure_ascii=False)
+                result = mc.delete_chapter(int(chapter_id))
+                return json.dumps({"success": True, **result}, ensure_ascii=False, default=str)
+
+            if action == "stats":
+                data = mc.stats()
+                return json.dumps({"success": True, "stats": data}, ensure_ascii=False, default=str)
+
+            if action == "add_link":
+                source_id = args.get("source_id")
+                target_id = args.get("target_id")
+                link_type = args.get("link_type") or "related"
+                if source_id is None or target_id is None:
+                    return json.dumps({"success": False, "error": "source_id and target_id are required"}, ensure_ascii=False)
+                mc.add_link(
+                    src_id=int(source_id),
+                    dst_id=int(target_id),
+                    link_type=str(link_type),
+                    weight=_get_float("weight", 1.0),
+                    note=args.get("note"),
+                )
+                return json.dumps({"success": True, "source_id": source_id, "target_id": target_id, "link_type": link_type}, ensure_ascii=False)
+
+            return json.dumps({"success": False, "error": f"unknown action: {action}"}, ensure_ascii=False)
+        except Exception as e:
+            logger.error("librarian tool failed: %s", e, exc_info=True)
+            return json.dumps({"success": False, "error": f"librarian tool failed: {e}"}, ensure_ascii=False)
 
     # ---- config (env-var-only, no setup wizard) -----------------------
 
@@ -195,7 +424,8 @@ class HMKMemoryProvider(MemoryProvider):
         return (
             "Long-term memory is available via hmk-memory: each turn you receive "
             f"a 'Memoria relevante' block under the user message, derived from {mode}. "
-            "Cite items as [mem:N] when you use them."
+            "Cite items as [mem:N] when you use them. "
+            "Use the `librarian` tool to query, add, update, delete, expand, or inspect the durable library."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
