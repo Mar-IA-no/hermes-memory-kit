@@ -1,0 +1,17 @@
+{
+  "_comment": "Default HMK corpus policy — shipped with the kit. Override via HMK_CORPUS_POLICY env var.",
+  "version": 1,
+  "source_classification": {
+    "code": [".py", ".sh", ".bash", ".zsh", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".c", ".cc", ".cpp", ".h", ".hpp", ".cu", ".cuh"],
+    "config": [".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".css", ".html"]
+  },
+  "never_touch_names": [
+    ".env", ".htpasswd", ".git-credentials", ".netrc",
+    ".pgpass", ".npmrc", ".pypirc", ".dockercfg"
+  ],
+  "never_touch_globs": [
+    "*.key", "*.pem", "id_rsa*", "id_ed25519*",
+    "*.tfstate", "*.kubeconfig"
+  ],
+  "name_contains_blocked": ["secret", "credential", "password"]
+}

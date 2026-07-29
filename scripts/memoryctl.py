@@ -69,6 +69,18 @@ def _require_config(purpose: str = "this operation"):
         )
         sys.exit(2)
 LEGACY_ROOT = os.environ.get("HMK_LEGACY_ROOT", "").strip()
+
+# corpus_policy module (v3.9.0) — selective embedding + secret scan
+try:
+    from corpus_policy import (
+        scan_content_for_secrets,
+        should_block_file,
+        classify_source_kind,
+    )
+except ImportError:
+    scan_content_for_secrets = None  # type: ignore
+    should_block_file = None  # type: ignore
+    classify_source_kind = None  # type: ignore
 DEFAULT_EMBED_PROVIDER = "nvidia"
 DEFAULT_EMBED_MODELS = {
     "nvidia": "nvidia/llama-3.2-nemoretriever-300m-embed-v1",
@@ -249,6 +261,15 @@ def migrate_add_embedding_bin(con):
         con.commit()
 
 
+def migrate_add_embed_disabled(con):
+    """v3.9.0: add embed_disabled + embed_disable_reason to chapters."""
+    columns = {col["name"] for col in con.execute("PRAGMA table_info(chapters)").fetchall()}
+    if "embed_disabled" not in columns:
+        con.execute("ALTER TABLE chapters ADD COLUMN embed_disabled INTEGER NOT NULL DEFAULT 0")
+    if "embed_disable_reason" not in columns:
+        con.execute("ALTER TABLE chapters ADD COLUMN embed_disable_reason TEXT")
+
+
 def migrate_embedding_table(con):
     row = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='chapter_embeddings'"
@@ -384,12 +405,25 @@ def init_db():
           PRIMARY KEY (chapter_id, provider, model)
         );
 
+        CREATE TABLE IF NOT EXISTS link_suggestions (
+          id INTEGER PRIMARY KEY,
+          src_chapter_id INTEGER NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+          dst_chapter_id INTEGER NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+          score REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'candidate',
+          created_at INTEGER NOT NULL,
+          reviewed_at INTEGER,
+          reviewer_note TEXT,
+          UNIQUE(src_chapter_id, dst_chapter_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_chapter_embeddings_provider_model
         ON chapter_embeddings(provider, model);
         """
     )
     migrate_embedding_table(con)
     migrate_add_embedding_bin(con)
+    migrate_add_embed_disabled(con)
     for name, description in DEFAULT_SHELVES.items():
         con.execute(
             "INSERT OR IGNORE INTO shelves(name, description) VALUES(?, ?)",
@@ -498,10 +532,23 @@ def add_text(shelf_name, title, raw, tags=None, importance=0.5, source_path=None
     book_id = upsert_book(con, shelf_name, title, source_path=source_path, source_kind=source_kind)
     if replace:
         clear_book_chapters(con, book_id)
+
+    # v3.9.0 — determine embed_disabled from content scan + source kind
+    embed_disabled = 0
+    embed_disable_reason = None
+    if source_kind in ("code", "config"):
+        embed_disabled = 1
+        embed_disable_reason = f"source_kind={source_kind}"
+    if embed_disabled == 0 and scan_content_for_secrets:
+        secret_reason = scan_content_for_secrets(raw)
+        if secret_reason:
+            embed_disabled = 1
+            embed_disable_reason = secret_reason
+
     cur = con.execute(
         """
-        INSERT INTO chapters(book_id, ordinal, title, spr, raw, tokens, importance, created_at, updated_at, tags_json)
-        VALUES(?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chapters(book_id, ordinal, title, spr, raw, tokens, importance, created_at, updated_at, tags_json, embed_disabled, embed_disable_reason)
+        VALUES(?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             book_id,
@@ -513,6 +560,8 @@ def add_text(shelf_name, title, raw, tags=None, importance=0.5, source_path=None
             now_ts(),
             now_ts(),
             json.dumps(tags),
+            embed_disabled,
+            embed_disable_reason,
         ),
     )
     chapter_id = cur.lastrowid
@@ -524,7 +573,20 @@ def add_text(shelf_name, title, raw, tags=None, importance=0.5, source_path=None
 
 def add_file(path, shelf_name, title=None, tags=None, importance=0.5, replace=True):
     p = Path(path)
+
+    # v3.9.0 — file-level blocking via corpus policy
+    if should_block_file:
+        blocked, reason = should_block_file(path)
+        if blocked:
+            raise SystemExit(f"ERROR: file blocked by corpus policy: {reason}")
+
     raw = p.read_text(encoding="utf-8", errors="replace")
+
+    # v3.9.0 — classify by extension for selective embedding
+    kind = "file"
+    if classify_source_kind:
+        kind = classify_source_kind(path)
+
     return add_text(
         shelf_name=shelf_name,
         title=title or p.stem,
@@ -532,7 +594,7 @@ def add_file(path, shelf_name, title=None, tags=None, importance=0.5, replace=Tr
         tags=tags or [],
         importance=importance,
         source_path=str(p),
-        source_kind="file",
+        source_kind=kind,
         replace=replace,
     )
 
@@ -1066,13 +1128,14 @@ def embedding_candidates(provider=None, model=None, limit=0, only_missing=True):
         sql += """
         LEFT JOIN chapter_embeddings e
           ON e.chapter_id = c.id AND e.provider = ? AND e.model = ?
-        WHERE e.chapter_id IS NULL
+        WHERE c.embed_disabled = 0 AND e.chapter_id IS NULL
         """
         params.extend([provider, model])
     else:
         sql += """
         LEFT JOIN chapter_embeddings e
           ON e.chapter_id = c.id AND e.provider = ? AND e.model = ?
+        WHERE c.embed_disabled = 0
         """
         params.extend([provider, model])
     sql += " ORDER BY c.id ASC"
@@ -1567,6 +1630,358 @@ def add_link(src_id, dst_id, link_type, weight=1.0, note=None):
     con.close()
 
 
+# --- suggest-links (v3.9.0) ---
+
+
+def suggest_links(chapter_id=None, limit=8, min_score=0.0, provider=None,
+                  model=None, dedup=True):
+    """Compute K nearest vector neighbors and store as candidate suggestions.
+
+    When chapter_id is given, only that chapter's neighbors are proposed.
+    When None, all chapters with embeddings are processed (batch mode).
+
+    Filters: no self-links, no already-linked pairs (either direction),
+    no same-book chapters.  Already existing candidates (any status) are
+    not duplicated (UNIQUE constraint).
+    """
+    cfg = embeddings_runtime_config(provider=provider, model=model)
+    provider = cfg["provider"]
+    model = cfg["model"]
+    init_db()
+    con = connect()
+
+    # Gather source chapters with embeddings for this provider/model.
+    src_sql = """
+        SELECT DISTINCT c.id, c.title, c.book_id, c.spr
+        FROM chapters c
+        JOIN chapter_embeddings e ON e.chapter_id = c.id
+        WHERE e.provider = ? AND e.model = ?
+          AND c.embed_disabled = 0
+    """
+    src_params: list = [provider, model]
+    if chapter_id is not None:
+        src_sql += " AND c.id = ?"
+        src_params.append(chapter_id)
+    src_rows = con.execute(src_sql, src_params).fetchall()
+    if not src_rows:
+        con.close()
+        return {"proposed": 0, "skipped": 0}
+
+    # Load all vectors once for batch mode.
+    vec_sql = """
+        SELECT e.chapter_id, e.embedding_json
+        FROM chapter_embeddings e
+        JOIN chapters c ON c.id = e.chapter_id
+        WHERE e.provider = ? AND e.model = ?
+          AND c.embed_disabled = 0
+    """
+    all_vecs = {
+        row["chapter_id"]: json.loads(row["embedding_json"])
+        for row in con.execute(vec_sql, (provider, model)).fetchall()
+    }
+    if not all_vecs:
+        con.close()
+        return {"proposed": 0, "skipped": 0}
+
+    proposed = 0
+    skipped = 0
+
+    for src_row in src_rows:
+        src_id = src_row["id"]
+        src_book = src_row["book_id"]
+        src_vec = all_vecs.get(src_id)
+        if src_vec is None:
+            continue
+
+        # Compute cosine similarity against all other chapters.
+        scored = []
+        for dst_id, dst_vec in all_vecs.items():
+            if dst_id == src_id:
+                continue
+            sim = cosine_similarity(src_vec, dst_vec)
+            if sim >= min_score:
+                scored.append((dst_id, sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Load filters: existing links + existing suggestions + same-book
+        existing_links = {
+            row["id2"]
+            for row in con.execute(
+                "SELECT src_chapter_id AS id2 FROM chapter_links WHERE dst_chapter_id=? "
+                "UNION SELECT dst_chapter_id AS id2 FROM chapter_links WHERE src_chapter_id=?",
+                (src_id, src_id),
+            ).fetchall()
+        }
+        existing_suggestions = {
+            row["id2"]
+            for row in con.execute(
+                "SELECT src_chapter_id AS id2 FROM link_suggestions WHERE dst_chapter_id=? "
+                "UNION SELECT dst_chapter_id AS id2 FROM link_suggestions WHERE src_chapter_id=?",
+                (src_id, src_id),
+            ).fetchall()
+        }
+        candidates_added = 0
+        for dst_id, sim in scored:
+            if candidates_added >= limit:
+                break
+            if dst_id in existing_links or dst_id in existing_suggestions:
+                skipped += 1
+                continue
+            # Check same-book
+            dst_book = con.execute(
+                "SELECT book_id FROM chapters WHERE id=?", (dst_id,)
+            ).fetchone()
+            if dst_book and dst_book["book_id"] == src_book:
+                skipped += 1
+                continue
+            # Insert suggestion
+            try:
+                con.execute(
+                    """INSERT INTO link_suggestions
+                       (src_chapter_id, dst_chapter_id, score, status, created_at)
+                       VALUES (?, ?, ?, 'candidate', ?)""",
+                    (src_id, dst_id, round(sim, 6), now_ts()),
+                )
+                proposed += 1
+                candidates_added += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+
+    con.commit()
+    con.close()
+    return {"proposed": proposed, "skipped": skipped, "provider": provider, "model": model}
+
+
+def list_link_suggestions(status=None, limit=50):
+    """List link suggestions with both chapters' context.
+
+    Status filter: None = all, or 'candidate'/'accepted'/'rejected'.
+    """
+    init_db()
+    con = connect()
+    sql = """
+        SELECT
+          ls.id, ls.src_chapter_id, ls.dst_chapter_id, ls.score,
+          ls.status, ls.created_at, ls.reviewed_at, ls.reviewer_note,
+          sc.title AS src_title, sc.spr AS src_spr,
+          dc.title AS dst_title, dc.spr AS dst_spr,
+          sb.title AS src_book, dbk.title AS dst_book
+        FROM link_suggestions ls
+        JOIN chapters sc ON sc.id = ls.src_chapter_id
+        JOIN chapters dc ON dc.id = ls.dst_chapter_id
+        JOIN books sb ON sb.id = sc.book_id
+        JOIN books dbk ON dbk.id = dc.book_id
+    """
+    params: list = []
+    if status:
+        sql += " WHERE ls.status = ?"
+        params.append(status)
+    sql += " ORDER BY ls.score DESC, ls.id ASC LIMIT ?"
+    params.append(limit)
+    rows = con.execute(sql, params).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def review_link_suggestion(suggestion_id, action, note=None):
+    """Accept or reject a link suggestion.
+
+    'accept' creates a real chapter_links edge (link_type='suggested',
+    weight=score) and marks the suggestion accepted.
+    'reject' marks it rejected so it won't be re-proposed.
+    """
+    if action not in ("accept", "reject"):
+        raise SystemExit(f"review_link_suggestion: action must be 'accept' or 'reject', got {action!r}")
+    init_db()
+    con = connect()
+    row = con.execute(
+        "SELECT * FROM link_suggestions WHERE id=?", (suggestion_id,)
+    ).fetchone()
+    if not row:
+        con.close()
+        raise SystemExit(f"suggestion not found: {suggestion_id}")
+    if row["status"] != "candidate":
+        con.close()
+        raise SystemExit(
+            f"suggestion {suggestion_id} is already {row['status']} (cannot {action})"
+        )
+
+    if action == "accept":
+        con.execute(
+            """INSERT OR REPLACE INTO chapter_links
+               (src_chapter_id, dst_chapter_id, link_type, weight, note, created_at)
+               VALUES (?, ?, 'suggested', ?, ?, ?)""",
+            (row["src_chapter_id"], row["dst_chapter_id"], row["score"], note, now_ts()),
+        )
+    con.execute(
+        "UPDATE link_suggestions SET status=?, reviewed_at=?, reviewer_note=? WHERE id=?",
+        (action, now_ts(), note, suggestion_id),
+    )
+    con.commit()
+    con.close()
+    return {"suggestion_id": suggestion_id, "action": action, "status": action}
+
+
+def update_chapter(chapter_id, content=None, title=None, tags=None, importance=None):
+    """Update a chapter in place (v3.8.0+).
+
+    Only the fields explicitly passed are changed; the rest are preserved.
+    When the embedded surface changes (content or title), all stored
+    embeddings for the chapter are dropped so the next embed-backfill
+    recomputes them from the new text — stale vectors are worse than
+    missing ones because they keep ranking the old content.
+
+    FTS is kept consistent via the contentless-table delete+insert pair.
+    When `title` changes, the parent book's title/slug are kept in sync;
+    a slug collision with another book aborts with a clear error.
+
+    Returns a small report dict.
+    """
+    if content is None and title is None and tags is None and importance is None:
+        raise SystemExit("update_chapter: nothing to update (pass content, title, tags, and/or importance)")
+    init_db()
+    con = connect()
+    row = con.execute("SELECT * FROM chapters WHERE id=?", (chapter_id,)).fetchone()
+    if not row:
+        con.close()
+        raise SystemExit(f"chapter not found: {chapter_id}")
+    old = dict(row)
+
+    new_raw = normalize_text(content) if content is not None else old["raw"]
+    new_title = title if title is not None else old["title"]
+    new_tags = list(tags) if tags is not None else json.loads(old["tags_json"] or "[]")
+    new_importance = float(importance) if importance is not None else old["importance"]
+    new_spr = simple_spr(new_raw)
+    content_changed = (new_raw != old["raw"]) or (new_title != old["title"])
+
+    # v3.9.0 — re-scan content for secrets on content change
+    embed_disabled_new = old.get("embed_disabled", 0)
+    embed_disable_reason_new = old.get("embed_disable_reason")
+    if content_changed and scan_content_for_secrets:
+        secret_reason = scan_content_for_secrets(new_raw)
+        if secret_reason:
+            embed_disabled_new = 1
+            embed_disable_reason_new = secret_reason
+
+    if title is not None and title != old["title"]:
+        new_slug = slugify(title)
+        collision = con.execute(
+            "SELECT id FROM books WHERE shelf_id=(SELECT shelf_id FROM books WHERE id=?) AND slug=? AND id != ?",
+            (old["book_id"], new_slug, old["book_id"]),
+        ).fetchone()
+        if collision:
+            con.close()
+            raise SystemExit(
+                f"update_chapter: title slug '{new_slug}' already used by book {collision['id']} "
+                f"on the same shelf; choose a different title"
+            )
+        con.execute(
+            "UPDATE books SET title=?, slug=?, updated_at=? WHERE id=?",
+            (new_title, new_slug, now_ts(), old["book_id"]),
+        )
+
+    delete_chapter_fts(con, old)
+    con.execute(
+        """
+        UPDATE chapters SET title=?, spr=?, raw=?, tokens=?, importance=?, updated_at=?, tags_json=?, embed_disabled=?, embed_disable_reason=?
+        WHERE id=?
+        """,
+        (
+            new_title,
+            new_spr,
+            new_raw,
+            token_estimate(new_raw),
+            new_importance,
+            now_ts(),
+            json.dumps(new_tags),
+            embed_disabled_new,
+            embed_disable_reason_new,
+            chapter_id,
+        ),
+    )
+    insert_chapter_fts(con, chapter_id, new_title, new_spr, new_raw, json.dumps(new_tags))
+
+    # The book container reflects the last content mutation, consistent with
+    # upsert_book() bumping updated_at on every add_text.
+    con.execute(
+        "UPDATE books SET updated_at=? WHERE id=?",
+        (now_ts(), old["book_id"]),
+    )
+
+    embeddings_dropped = 0
+    if content_changed:
+        cur = con.execute("DELETE FROM chapter_embeddings WHERE chapter_id=?", (chapter_id,))
+        embeddings_dropped = cur.rowcount
+
+    con.commit()
+    con.close()
+    return {
+        "chapter_id": chapter_id,
+        "content_changed": content_changed,
+        "embeddings_dropped": embeddings_dropped,
+        "title": new_title,
+        "tags": new_tags,
+        "importance": new_importance,
+        "embed_disabled": embed_disabled_new,
+        "embed_disable_reason": embed_disable_reason_new,
+    }
+
+
+def delete_chapter(chapter_id, prune_book=True):
+    """Delete a chapter and its dependent rows (v3.8.0+).
+
+    chapter_embeddings and chapter_links are removed by the ON DELETE
+    CASCADE declared in the schema (connect() enables PRAGMA foreign_keys).
+    The FTS row needs the explicit contentless-table delete. When the parent
+    book is left without chapters it is pruned too (disable with
+    prune_book=False).
+
+    The report includes title + sha256 of the deleted raw content so the
+    caller can archive it before or after the fact if needed.
+    """
+    init_db()
+    con = connect()
+    row = con.execute(
+        "SELECT id, book_id, title, spr, raw, tags_json FROM chapters WHERE id=?",
+        (chapter_id,),
+    ).fetchone()
+    if not row:
+        con.close()
+        raise SystemExit(f"chapter not found: {chapter_id}")
+
+    title = row["title"]
+    raw_sha256 = text_hash(row["raw"] or "")
+    embeddings_removed = con.execute(
+        "SELECT COUNT(*) FROM chapter_embeddings WHERE chapter_id=?", (chapter_id,)
+    ).fetchone()[0]
+    links_removed = con.execute(
+        "SELECT COUNT(*) FROM chapter_links WHERE src_chapter_id=? OR dst_chapter_id=?",
+        (chapter_id, chapter_id),
+    ).fetchone()[0]
+
+    delete_chapter_fts(con, row)
+    con.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+
+    book_deleted = False
+    remaining = con.execute(
+        "SELECT COUNT(*) FROM chapters WHERE book_id=?", (row["book_id"],)
+    ).fetchone()[0]
+    if prune_book and remaining == 0:
+        con.execute("DELETE FROM books WHERE id=?", (row["book_id"],))
+        book_deleted = True
+
+    con.commit()
+    con.close()
+    return {
+        "chapter_id": chapter_id,
+        "title": title,
+        "raw_sha256": raw_sha256,
+        "embeddings_removed": embeddings_removed,
+        "links_removed": links_removed,
+        "book_deleted": book_deleted,
+    }
+
+
 def log_query(query_text, budget_tokens, result_count, null_retrieval, details):
     init_db()
     con = connect()
@@ -1591,7 +2006,26 @@ def stats():
         "chapters": con.execute("SELECT COUNT(*) FROM chapters").fetchone()[0],
         "embeddings": con.execute("SELECT COUNT(*) FROM chapter_embeddings").fetchone()[0],
         "links": con.execute("SELECT COUNT(*) FROM chapter_links").fetchone()[0],
+        "suggestions": con.execute(
+            "SELECT COUNT(*) FROM link_suggestions WHERE status='candidate'"
+        ).fetchone()[0],
+        "suggestions_total": con.execute("SELECT COUNT(*) FROM link_suggestions").fetchone()[0],
         "queries": con.execute("SELECT COUNT(*) FROM queries_log").fetchone()[0],
+        "embed_disabled": con.execute(
+            "SELECT COUNT(*) FROM chapters WHERE embed_disabled=1"
+        ).fetchone()[0],
+        "embed_disabled_by_reason": [
+            dict(row)
+            for row in con.execute(
+                """
+                SELECT embed_disable_reason AS reason, COUNT(*) AS count
+                FROM chapters
+                WHERE embed_disabled=1 AND embed_disable_reason IS NOT NULL
+                GROUP BY embed_disable_reason
+                ORDER BY count DESC
+                """
+            ).fetchall()
+        ],
         "embedding_sets": [
             dict(row)
             for row in con.execute(
@@ -1850,12 +2284,37 @@ def main():
     p_expand = sub.add_parser("expand")
     p_expand.add_argument("--id", type=int, required=True)
 
+    p_update = sub.add_parser("update", help="update a chapter in place (content/title/tags/importance)")
+    p_update.add_argument("--id", type=int, required=True)
+    p_update.add_argument("--raw", help="new content (recomputed spr; drops stored embeddings)")
+    p_update.add_argument("--title", help="new title (keeps book title/slug in sync)")
+    p_update.add_argument("--tags", help="CSV of tags; replaces the tag set when provided")
+    p_update.add_argument("--importance", type=float)
+
+    p_delete = sub.add_parser("delete", help="delete a chapter (cascades embeddings/links; prunes empty book)")
+    p_delete.add_argument("--id", type=int, required=True)
+    p_delete.add_argument("--keep-book", action="store_true", help="keep the parent book even if left empty")
+
     p_link = sub.add_parser("link")
     p_link.add_argument("--src", type=int, required=True)
     p_link.add_argument("--dst", type=int, required=True)
     p_link.add_argument("--type", required=True)
     p_link.add_argument("--weight", type=float, default=1.0)
     p_link.add_argument("--note")
+
+    p_suggest = sub.add_parser("suggest-links", help="discover link candidates via vector similarity")
+    p_suggest.add_argument("--chapter-id", type=int, help="suggest links for a single chapter (omit for all)")
+    p_suggest.add_argument("--limit", type=int, default=8, help="max suggestions per chapter (default 8)")
+    p_suggest.add_argument("--min-score", type=float, default=0.0)
+    p_suggest.add_argument("--provider", default=default_embed_provider())
+    p_suggest.add_argument("--model")
+
+    p_review = sub.add_parser("review-links", help="review link suggestions (list/accept/reject)")
+    p_review.add_argument("--status", help="filter by status (candidate/accepted/rejected)")
+    p_review.add_argument("--limit", type=int, default=50, help="max suggestions to list")
+    p_review.add_argument("--accept", type=int, help="accept suggestion by id")
+    p_review.add_argument("--reject", type=int, help="reject suggestion by id")
+    p_review.add_argument("--note", help="reviewer note (for accept/reject)")
 
     p_embed = sub.add_parser("embed-backfill")
     p_embed.add_argument("--provider", default=default_embed_provider())
@@ -1939,9 +2398,38 @@ def main():
         ), indent=2))
     elif args.command == "expand":
         print(json.dumps(expand(args.id), indent=2))
+    elif args.command == "update":
+        result = update_chapter(
+            args.id,
+            content=args.raw,
+            title=args.title,
+            tags=parse_tags(args.tags) if args.tags is not None else None,
+            importance=args.importance,
+        )
+        print(json.dumps({"ok": True, **result}, indent=2, ensure_ascii=False))
+    elif args.command == "delete":
+        result = delete_chapter(args.id, prune_book=not args.keep_book)
+        print(json.dumps({"ok": True, **result}, indent=2, ensure_ascii=False))
     elif args.command == "link":
         add_link(args.src, args.dst, args.type, args.weight, args.note)
         print(json.dumps({"ok": True}, indent=2))
+    elif args.command == "suggest-links":
+        result = suggest_links(
+            chapter_id=args.chapter_id,
+            limit=args.limit,
+            min_score=args.min_score,
+            provider=args.provider,
+            model=args.model,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif args.command == "review-links":
+        if args.accept:
+            result = review_link_suggestion(args.accept, "accept", args.note)
+        elif args.reject:
+            result = review_link_suggestion(args.reject, "reject", args.note)
+        else:
+            result = list_link_suggestions(status=args.status, limit=args.limit)
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     elif args.command == "embed-backfill":
         result = backfill_embeddings(
             provider=args.provider,
