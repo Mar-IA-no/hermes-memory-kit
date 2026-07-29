@@ -1567,6 +1567,153 @@ def add_link(src_id, dst_id, link_type, weight=1.0, note=None):
     con.close()
 
 
+def update_chapter(chapter_id, content=None, title=None, tags=None, importance=None):
+    """Update a chapter in place (v3.8.0+).
+
+    Only the fields explicitly passed are changed; the rest are preserved.
+    When the embedded surface changes (content or title), all stored
+    embeddings for the chapter are dropped so the next embed-backfill
+    recomputes them from the new text — stale vectors are worse than
+    missing ones because they keep ranking the old content.
+
+    FTS is kept consistent via the contentless-table delete+insert pair.
+    When `title` changes, the parent book's title/slug are kept in sync;
+    a slug collision with another book aborts with a clear error.
+
+    Returns a small report dict.
+    """
+    if content is None and title is None and tags is None and importance is None:
+        raise SystemExit("update_chapter: nothing to update (pass content, title, tags, and/or importance)")
+    init_db()
+    con = connect()
+    row = con.execute("SELECT * FROM chapters WHERE id=?", (chapter_id,)).fetchone()
+    if not row:
+        con.close()
+        raise SystemExit(f"chapter not found: {chapter_id}")
+    old = dict(row)
+
+    new_raw = normalize_text(content) if content is not None else old["raw"]
+    new_title = title if title is not None else old["title"]
+    new_tags = list(tags) if tags is not None else json.loads(old["tags_json"] or "[]")
+    new_importance = float(importance) if importance is not None else old["importance"]
+    new_spr = simple_spr(new_raw)
+    content_changed = (new_raw != old["raw"]) or (new_title != old["title"])
+
+    if title is not None and title != old["title"]:
+        new_slug = slugify(title)
+        collision = con.execute(
+            "SELECT id FROM books WHERE shelf_id=(SELECT shelf_id FROM books WHERE id=?) AND slug=? AND id != ?",
+            (old["book_id"], new_slug, old["book_id"]),
+        ).fetchone()
+        if collision:
+            con.close()
+            raise SystemExit(
+                f"update_chapter: title slug '{new_slug}' already used by book {collision['id']} "
+                f"on the same shelf; choose a different title"
+            )
+        con.execute(
+            "UPDATE books SET title=?, slug=?, updated_at=? WHERE id=?",
+            (new_title, new_slug, now_ts(), old["book_id"]),
+        )
+
+    delete_chapter_fts(con, old)
+    con.execute(
+        """
+        UPDATE chapters SET title=?, spr=?, raw=?, tokens=?, importance=?, updated_at=?, tags_json=?
+        WHERE id=?
+        """,
+        (
+            new_title,
+            new_spr,
+            new_raw,
+            token_estimate(new_raw),
+            new_importance,
+            now_ts(),
+            json.dumps(new_tags),
+            chapter_id,
+        ),
+    )
+    insert_chapter_fts(con, chapter_id, new_title, new_spr, new_raw, json.dumps(new_tags))
+
+    # The book container reflects the last content mutation, consistent with
+    # upsert_book() bumping updated_at on every add_text.
+    con.execute(
+        "UPDATE books SET updated_at=? WHERE id=?",
+        (now_ts(), old["book_id"]),
+    )
+
+    embeddings_dropped = 0
+    if content_changed:
+        cur = con.execute("DELETE FROM chapter_embeddings WHERE chapter_id=?", (chapter_id,))
+        embeddings_dropped = cur.rowcount
+
+    con.commit()
+    con.close()
+    return {
+        "chapter_id": chapter_id,
+        "content_changed": content_changed,
+        "embeddings_dropped": embeddings_dropped,
+        "title": new_title,
+        "tags": new_tags,
+        "importance": new_importance,
+    }
+
+
+def delete_chapter(chapter_id, prune_book=True):
+    """Delete a chapter and its dependent rows (v3.8.0+).
+
+    chapter_embeddings and chapter_links are removed by the ON DELETE
+    CASCADE declared in the schema (connect() enables PRAGMA foreign_keys).
+    The FTS row needs the explicit contentless-table delete. When the parent
+    book is left without chapters it is pruned too (disable with
+    prune_book=False).
+
+    The report includes title + sha256 of the deleted raw content so the
+    caller can archive it before or after the fact if needed.
+    """
+    init_db()
+    con = connect()
+    row = con.execute(
+        "SELECT id, book_id, title, spr, raw, tags_json FROM chapters WHERE id=?",
+        (chapter_id,),
+    ).fetchone()
+    if not row:
+        con.close()
+        raise SystemExit(f"chapter not found: {chapter_id}")
+
+    title = row["title"]
+    raw_sha256 = text_hash(row["raw"] or "")
+    embeddings_removed = con.execute(
+        "SELECT COUNT(*) FROM chapter_embeddings WHERE chapter_id=?", (chapter_id,)
+    ).fetchone()[0]
+    links_removed = con.execute(
+        "SELECT COUNT(*) FROM chapter_links WHERE src_chapter_id=? OR dst_chapter_id=?",
+        (chapter_id, chapter_id),
+    ).fetchone()[0]
+
+    delete_chapter_fts(con, row)
+    con.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+
+    book_deleted = False
+    remaining = con.execute(
+        "SELECT COUNT(*) FROM chapters WHERE book_id=?", (row["book_id"],)
+    ).fetchone()[0]
+    if prune_book and remaining == 0:
+        con.execute("DELETE FROM books WHERE id=?", (row["book_id"],))
+        book_deleted = True
+
+    con.commit()
+    con.close()
+    return {
+        "chapter_id": chapter_id,
+        "title": title,
+        "raw_sha256": raw_sha256,
+        "embeddings_removed": embeddings_removed,
+        "links_removed": links_removed,
+        "book_deleted": book_deleted,
+    }
+
+
 def log_query(query_text, budget_tokens, result_count, null_retrieval, details):
     init_db()
     con = connect()
@@ -1850,6 +1997,17 @@ def main():
     p_expand = sub.add_parser("expand")
     p_expand.add_argument("--id", type=int, required=True)
 
+    p_update = sub.add_parser("update", help="update a chapter in place (content/title/tags/importance)")
+    p_update.add_argument("--id", type=int, required=True)
+    p_update.add_argument("--raw", help="new content (recomputed spr; drops stored embeddings)")
+    p_update.add_argument("--title", help="new title (keeps book title/slug in sync)")
+    p_update.add_argument("--tags", help="CSV of tags; replaces the tag set when provided")
+    p_update.add_argument("--importance", type=float)
+
+    p_delete = sub.add_parser("delete", help="delete a chapter (cascades embeddings/links; prunes empty book)")
+    p_delete.add_argument("--id", type=int, required=True)
+    p_delete.add_argument("--keep-book", action="store_true", help="keep the parent book even if left empty")
+
     p_link = sub.add_parser("link")
     p_link.add_argument("--src", type=int, required=True)
     p_link.add_argument("--dst", type=int, required=True)
@@ -1939,6 +2097,18 @@ def main():
         ), indent=2))
     elif args.command == "expand":
         print(json.dumps(expand(args.id), indent=2))
+    elif args.command == "update":
+        result = update_chapter(
+            args.id,
+            content=args.raw,
+            title=args.title,
+            tags=parse_tags(args.tags) if args.tags is not None else None,
+            importance=args.importance,
+        )
+        print(json.dumps({"ok": True, **result}, indent=2, ensure_ascii=False))
+    elif args.command == "delete":
+        result = delete_chapter(args.id, prune_book=not args.keep_book)
+        print(json.dumps({"ok": True, **result}, indent=2, ensure_ascii=False))
     elif args.command == "link":
         add_link(args.src, args.dst, args.type, args.weight, args.note)
         print(json.dumps({"ok": True}, indent=2))

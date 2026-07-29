@@ -1,3 +1,36 @@
+## [3.8.1] — 2026-07-28
+
+### Added
+- `memoryctl.update_chapter(chapter_id, content=, title=, tags=, importance=)`:
+  in-place chapter edit. Only passed fields change; FTS5 is kept consistent
+  via the contentless-table delete+insert pair; when content or title change,
+  stored embeddings are dropped so `embed-backfill` recomputes them from the
+  new text. Title changes keep the parent book's title/slug in sync and abort
+  cleanly on slug collisions.
+- `memoryctl.delete_chapter(chapter_id, prune_book=True)`: removes the chapter,
+  its FTS row, and (via ON DELETE CASCADE) its embeddings and links; prunes
+  the parent book when left empty. The report includes `raw_sha256` so callers
+  can archive content before deleting.
+- CLI subcommands `memoryctl.py update` / `memoryctl.py delete`.
+- `librarian` tool (hmk-memory plugin) gains `update` and `delete` actions.
+  Plugin bumped to 1.1.0. `hermes hmk-memory` CLI gains matching `update` /
+  `delete` subcommands; plugin README documents the `librarian` tool.
+- `tests/test_memoryctl_update_delete.py`: 11 tests against a real temp
+  library.db covering FTS consistency, embedding drop/preserve, slug
+  collisions, cascade, book pruning, and the CLI roundtrip.
+
+### Fixed
+- `test_get_tool_schemas_empty` was stale since v3.8.0 (the provider exposes
+  the `librarian` tool); replaced with an invariant test over the action enum.
+
+## [3.8.0] — 2026-07-22
+
+### Added
+- `librarian` model tool exposed by the hmk-memory provider: `query`, `search`,
+  `add_text`, `add_file`, `expand`, `stats`, `add_link` actions over the
+  canonical library.db, plus `hermes hmk-memory` CLI commands.
+  (Shipped deployed-but-uncommitted; committed retroactively with 3.8.1.)
+
 ## [3.7.3] — 2026-05-09
 
 ### Fixed
