@@ -83,6 +83,33 @@ Restart the gateway. Hermes' single-provider rule means only one external
 memory provider is active at a time — if you have another (`mem0`,
 `hindsight`, `openviking`, etc.) you'll need to choose.
 
+## The `librarian` tool
+
+When this provider is active, agents also get a `librarian` model tool for
+read/write access to the library from inside the conversation. Actions:
+
+| Action | Purpose |
+|---|---|
+| `query` | Hybrid (lexical + semantic) retrieval, ranked items |
+| `search` | Pure lexical FTS search |
+| `add_text` | Store a new text chapter under a shelf |
+| `add_file` | Ingest a file from disk into a shelf |
+| `expand` | Full record for a chapter id, including neighbors |
+| `update` | Edit a chapter in place (content/title/tags/importance); drops stale embeddings when content or title change |
+| `delete` | Remove a chapter; cascades embeddings/links, prunes the empty parent book |
+| `stats` | Library counts and embedding metadata |
+| `add_link` | Create a directed link between two chapters |
+
+The same lifecycle is available to operators as
+`hermes hmk-memory <query|search|add-text|add-file|expand|update|delete|stats|link>`
+and as `memoryctl.py <update|delete>` for script use.
+
+`update` only changes the fields you pass. When content or title change, the
+chapter's stored embeddings are dropped so the next `embed-backfill`
+recomputes them from the new text — stale vectors would keep ranking the old
+content. `delete` returns the deleted chapter's `raw_sha256` so callers can
+verify an archive taken beforehand.
+
 ## Verify
 
 After activation, `hermes hmk-memory status` prints DB path, ENGRAM presence,
