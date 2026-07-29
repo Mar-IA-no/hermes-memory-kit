@@ -1,3 +1,82 @@
+## [3.9.0] — 2026-07-29
+
+### Added
+- **Corpus policy** (`scripts/corpus_policy.py`): file-level blocking
+  (never-touch filenames/globs/name-contains) + content-level secret scan
+  (structural credential patterns: private keys, API tokens, JWTs, Bearer
+  headers). Activated automatically on `add_file`, `add_text`, `ingest_any`,
+  and `update_chapter` content changes.
+- **Selective embedding**: code (`.py`, `.js`, `.sh`, etc.) and config
+  (`.yaml`, `.json`, `.toml`, etc.) files are classified at ingest time and
+  excluded from embedding — semantically indexed only via FTS5.
+  Backed by `embed_disabled` + `embed_disable_reason` columns on chapters.
+- `memoryctl stats` now reports `embed_disabled` count and
+  `embed_disabled_by_reason` breakdown.
+- `embedding_candidates()` / `embed-backfill` skip `embed_disabled` chapters.
+- `memoryctl add_file` blocks protected files (`.env`, `*.key`, `id_rsa*`,
+  `*secret*`, etc.) with exit code 2 and a rule citation.
+- `scripts/default_corpus_policy.json` — shipped default, overridable via
+  `HMK_CORPUS_POLICY` env var. Fail-closed on unreadable policy files.
+- `tests/test_corpus_policy.py` — 30 tests covering file blocking, secret
+  scan, classification, policy loading, and full integration with
+  memoryctl add_file/add_text/update/stats/embed-candidates.
+- **Suggest-links**: `memoryctl suggest-links` discovers link candidates
+  via vector cosine similarity (K nearest neighbors from stored embeddings),
+  filtering out self-links, already-linked pairs, and same-book chapters.
+  Candidates are stored in the `link_suggestions` table with status
+  `candidate`; `memoryctl review-links --accept/--reject` triggers the
+  human-review guard. The librarian tool exposes a read-only `suggest_links`
+  action — accept/reject stays CLI-side so the agent cannot self-approve
+  graph mutations.
+
+### Changed
+- `update_chapter` now re-scans content for secrets and updates
+  `embed_disabled` / `embed_disable_reason` accordingly. Report includes
+  the new fields.
+- `ingest_any.py` enforces file-level blocking and sets `source_kind`
+  classification for selective embedding.
+- **Atomic projection**: `export_obsidian.py` now builds into a staging
+  dir (`<vault>/.staging/<run_id>/`) and atomically swaps to
+  `<vault>/live/` via `os.rename`. A `projection-manifest.json` with
+  per-note content hashes enables idempotent rebuilds (unchanged notes
+  are skipped; counts reported as written/unchanged/removed_orphans).
+  Orphan notes for deleted chapters are pruned automatically.
+  `--check` mode exits non-zero on drift (CI/cron guard).
+  Takes the maintenance flock for safety.
+
+## [3.8.1] — 2026-07-28
+
+### Added
+- `memoryctl.update_chapter(chapter_id, content=, title=, tags=, importance=)`:
+  in-place chapter edit. Only passed fields change; FTS5 is kept consistent
+  via the contentless-table delete+insert pair; when content or title change,
+  stored embeddings are dropped so `embed-backfill` recomputes them from the
+  new text. Title changes keep the parent book's title/slug in sync and abort
+  cleanly on slug collisions.
+- `memoryctl.delete_chapter(chapter_id, prune_book=True)`: removes the chapter,
+  its FTS row, and (via ON DELETE CASCADE) its embeddings and links; prunes
+  the parent book when left empty. The report includes `raw_sha256` so callers
+  can archive content before deleting.
+- CLI subcommands `memoryctl.py update` / `memoryctl.py delete`.
+- `librarian` tool (hmk-memory plugin) gains `update` and `delete` actions.
+  Plugin bumped to 1.1.0. `hermes hmk-memory` CLI gains matching `update` /
+  `delete` subcommands; plugin README documents the `librarian` tool.
+- `tests/test_memoryctl_update_delete.py`: 11 tests against a real temp
+  library.db covering FTS consistency, embedding drop/preserve, slug
+  collisions, cascade, book pruning, and the CLI roundtrip.
+
+### Fixed
+- `test_get_tool_schemas_empty` was stale since v3.8.0 (the provider exposes
+  the `librarian` tool); replaced with an invariant test over the action enum.
+
+## [3.8.0] — 2026-07-22
+
+### Added
+- `librarian` model tool exposed by the hmk-memory provider: `query`, `search`,
+  `add_text`, `add_file`, `expand`, `stats`, `add_link` actions over the
+  canonical library.db, plus `hermes hmk-memory` CLI commands.
+  (Shipped deployed-but-uncommitted; committed retroactively with 3.8.1.)
+
 ## [3.7.3] — 2026-05-09
 
 ### Fixed

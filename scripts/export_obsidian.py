@@ -1,23 +1,89 @@
 #!/usr/bin/env python3
+"""Proyecta nodos de library.db a un vault de Obsidian con staging atomico.
+
+v3.9.0 — atomic publish + idempotent manifest:
+- Build into <vault>/.staging/<run_id>/ (temporary, invisible to Obsidian)
+- Write manifest.json with per-note content sha256 hashes
+- Idempotency: skip rewriting notes whose hash matches the manifest;
+  report written/unchanged/removed counts
+- Atomic swap: os.rename the staging dir into <vault>/live/ after build
+- Prune notes for chapters that no longer exist
+- Takes the maintenance flock before building
+- Optional --check mode: exit non-zero if the published projection differs
+  from a fresh build (drift detector for CI/cron)
+"""
+
 import argparse
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-BASE_DIR = Path(os.environ.get("HMK_BASE_DIR", str(REPO_ROOT / "agent-memory"))).expanduser()
+
+WORKSPACE_ROOT = Path(os.environ.get("HMK_WORKSPACE_ROOT", str(Path.cwd())))
+BASE_DIR = Path(os.environ.get(
+    "HMK_BASE_DIR", "HMK_AGENT_MEMORY_BASE" in os.environ
+    and os.environ["HMK_AGENT_MEMORY_BASE"]
+    or str(REPO_ROOT / "agent-memory")
+)).expanduser()
 DB_PATH = Path(os.environ.get("HMK_DB_PATH", str(BASE_DIR / "library.db"))).expanduser()
 VAULT_DIR = Path(os.environ.get("HMK_VAULT_DIR", str(REPO_ROOT / "wiki"))).expanduser()
-MANIFEST_PATH = VAULT_DIR / ".projection-manifest.json"
 
-DEFAULT_IDS = [int(item) for item in os.environ.get("HMK_EXPORT_IDS", "").split(",") if item.strip()]
-LINK_TYPES = ["summarizes", "depends_on", "related_to", "evidence_for", "anchors", "references"]
+MANIFEST_FILENAME = "projection-manifest.json"
+LIVE_DIR_NAME = "live"
+STAGING_DIR_NAME = ".staging"
+LINK_TYPES = ["summarizes", "depends_on", "related_to", "evidence_for",
+              "anchors", "references"]
 
+DEFAULT_IDS = [int(item) for item in
+               os.environ.get("HMK_EXPORT_IDS", "").split(",")
+               if item.strip()]
+
+
+# ---------------------------------------------------------------------------
+# flock (reuse the same pattern as memoryctl)
+# ---------------------------------------------------------------------------
+
+def _lock_maintenance():
+    import fcntl
+    lock_path = BASE_DIR / ".maintenance.lock"
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    except OSError as exc:
+        raise SystemExit(f"ERROR: cannot open maintenance lock at {lock_path}: {exc}")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise SystemExit(
+            "ERROR: another maintenance process holds the lock.\n"
+            f"  Lock file: {lock_path}"
+        )
+    return fd
+
+
+def _unlock_maintenance(fd):
+    import fcntl
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -26,6 +92,10 @@ def now_iso():
 def slugify(text):
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug or "item"
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def connect():
@@ -38,18 +108,9 @@ def fetch_chapter(con, chapter_id):
     row = con.execute(
         """
         SELECT
-          c.id,
-          c.book_id,
-          c.title,
-          c.spr,
-          c.raw,
-          c.tokens,
-          c.importance,
-          c.tags_json,
-          c.updated_at,
-          b.title AS book_title,
-          b.source_path,
-          b.slug AS book_slug,
+          c.id, c.book_id, c.title, c.spr, c.raw, c.tokens,
+          c.importance, c.tags_json, c.updated_at,
+          b.title AS book_title, b.source_path, b.slug AS book_slug,
           s.name AS shelf
         FROM chapters c
         JOIN books b ON b.id = c.book_id
@@ -66,7 +127,8 @@ def fetch_chapter(con, chapter_id):
         dict(link)
         for link in con.execute(
             """
-            SELECT l.link_type, l.dst_chapter_id AS other_id, c.title AS other_title
+            SELECT l.link_type, l.dst_chapter_id AS other_id,
+                   c.title AS other_title
             FROM chapter_links l
             JOIN chapters c ON c.id = l.dst_chapter_id
             WHERE l.src_chapter_id=?
@@ -79,7 +141,8 @@ def fetch_chapter(con, chapter_id):
         dict(link)
         for link in con.execute(
             """
-            SELECT l.link_type, l.src_chapter_id AS other_id, c.title AS other_title
+            SELECT l.link_type, l.src_chapter_id AS other_id,
+                   c.title AS other_title
             FROM chapter_links l
             JOIN chapters c ON c.id = l.src_chapter_id
             WHERE l.dst_chapter_id=?
@@ -90,6 +153,10 @@ def fetch_chapter(con, chapter_id):
     ]
     return data
 
+
+# ---------------------------------------------------------------------------
+# classification and rendering
+# ---------------------------------------------------------------------------
 
 def classify_folder(chapter):
     tags = set(chapter["tags"])
@@ -102,7 +169,7 @@ def classify_folder(chapter):
             return "projects"
         return "maps"
     if shelf == "library":
-        if "summary" in tags or "resumen" in title or "sintesis" in title or "integracion" in title:
+        if "summary" in tags or "resumen" in title:
             return "synthesis"
         if "install-guide" in tags or "guide" in title:
             return "sources"
@@ -118,7 +185,8 @@ def classify_folder(chapter):
 
 def pretty_title(title):
     text = title.replace("-", " ").strip()
-    parts = [chunk.capitalize() if chunk.islower() else chunk for chunk in text.split()]
+    parts = [chunk.capitalize() if chunk.islower() else chunk
+             for chunk in text.split()]
     return " ".join(parts) or title
 
 
@@ -150,7 +218,8 @@ def wikilink_for(other_id, mapping, fallback_title):
 def group_links(chapter, mapping):
     groups = defaultdict(list)
     for link in chapter["links_out"]:
-        groups[link["link_type"]].append(wikilink_for(link["other_id"], mapping, link["other_title"]))
+        groups[link["link_type"]].append(
+            wikilink_for(link["other_id"], mapping, link["other_title"]))
     return groups
 
 
@@ -183,15 +252,13 @@ def render_frontmatter(chapter, projection, mapping):
     for key in LINK_TYPES:
         lines.append(f"  {key}:")
         lines.append(yaml_list(link_map.get(key, []), indent=4))
-    lines.extend(
-        [
-            "source_paths:",
-            yaml_list(source_paths, indent=2),
-            f'last_projected_at: "{now_iso()}"',
-            'projection_status: "active"',
-            "---",
-        ]
-    )
+    lines.extend([
+        "source_paths:",
+        yaml_list(source_paths, indent=2),
+        f'last_projected_at: "{now_iso()}"',
+        'projection_status: "active"',
+        "---",
+    ])
     return "\n".join(lines)
 
 
@@ -234,27 +301,43 @@ def render_body(chapter, projection, mapping):
         if chapter["source_path"]:
             lines.append(f"- source_path: `{chapter['source_path']}`")
         lines.extend([f"- {item}" for item in links.get("evidence_for", [])])
-    lines.extend(
-        [
-            "",
-            "## Canonical Memory",
-            f"- chapter_id: `{chapter['id']}`",
-            f"- shelf: `{chapter['shelf']}`",
-            f"- book_title: `{chapter['book_title']}`",
-            "- raw_ref: `library.db`",
-        ]
-    )
+    lines.extend([
+        "",
+        "## Canonical Memory",
+        f"- chapter_id: `{chapter['id']}`",
+        f"- shelf: `{chapter['shelf']}`",
+        f"- book_title: `{chapter['book_title']}`",
+        "- raw_ref: `library.db`",
+    ])
     return "\n".join(lines).strip() + "\n"
 
 
-def write_note(chapter, projection, mapping):
-    path = VAULT_DIR / projection["path"]
+# ---------------------------------------------------------------------------
+# note writing with idempotency
+# ---------------------------------------------------------------------------
+
+def write_note(chapter, projection, mapping, staging_root: Path,
+               manifest: Dict[int, str]):
+    """Write a note to the staging dir.  Skip if content hash matches manifest."""
+    content = (render_frontmatter(chapter, projection, mapping)
+               + "\n\n"
+               + render_body(chapter, projection, mapping))
+    note_hash = content_hash(content)
+
+    if manifest.get(chapter["id"]) == note_hash:
+        return "unchanged", note_hash
+
+    path = staging_root / projection["path"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = render_frontmatter(chapter, projection, mapping) + "\n\n" + render_body(chapter, projection, mapping)
     path.write_text(content, encoding="utf-8")
+    return "written", note_hash
 
 
-def write_index(mapping):
+# ---------------------------------------------------------------------------
+# index and map
+# ---------------------------------------------------------------------------
+
+def write_index(mapping, staging_root: Path):
     groups = defaultdict(list)
     for chapter_id, meta in mapping.items():
         groups[meta["folder"]].append((chapter_id, meta))
@@ -265,21 +348,25 @@ def write_index(mapping):
         "",
         "## Sections",
     ]
-    for folder in ["maps", "projects", "concepts", "entities", "sources", "synthesis", "log"]:
+    for folder in ["maps", "projects", "concepts", "entities",
+                   "sources", "synthesis", "log"]:
         lines.append(f"- {folder}/")
-        for chapter_id, meta in sorted(groups.get(folder, []), key=lambda item: item[1]["title"].lower()):
+        for chapter_id, meta in sorted(groups.get(folder, []),
+                                        key=lambda item: item[1]["title"].lower()):
             lines.append(f"  - [[{meta['slug']}]] (`mem:{chapter_id}`)")
-    (VAULT_DIR / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (staging_root / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_map_note(mapping):
+def write_map_note(mapping, staging_root: Path):
     by_folder = defaultdict(list)
     for chapter_id, meta in mapping.items():
         by_folder[meta["folder"]].append((chapter_id, meta))
 
     def lines_for(folder, limit=4):
-        rows = sorted(by_folder.get(folder, []), key=lambda item: item[1]["title"].lower())
-        return [f"- [[{meta['slug']}]] (`mem:{chapter_id}`)" for chapter_id, meta in rows[:limit]]
+        rows = sorted(by_folder.get(folder, []),
+                      key=lambda item: item[1]["title"].lower())
+        return [f"- [[{meta['slug']}]] (`mem:{chapter_id}`)"
+                for chapter_id, meta in rows[:limit]]
 
     lines = [
         "# Project Memory System",
@@ -293,70 +380,222 @@ def write_map_note(mapping):
     ]
     core_lines = lines_for("projects") + lines_for("concepts")
     lines.extend(core_lines[:6] or ["- pendiente de proyeccion"])
-    lines.extend(
-        [
-            "",
-            "## Integrations",
-        ]
-    )
+    lines.extend(["", "## Integrations"])
     lines.extend(lines_for("sources", limit=3) or ["- pendiente de proyeccion"])
-    lines.extend(
-        [
-            "",
-            "## Notes",
-            "- este mapa es sintetico;",
-            "- para evidencia o detalle, volver a la biblioteca canonica.",
-        ]
-    )
-    path = VAULT_DIR / "maps" / "project-memory-system.md"
+    lines.extend([
+        "",
+        "## Notes",
+        "- este mapa es sintetico;",
+        "- para evidencia o detalle, volver a la biblioteca canonica.",
+    ])
+    path = staging_root / "maps" / "project-memory-system.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_manifest(chapters, mapping):
+# ---------------------------------------------------------------------------
+# manifest
+# ---------------------------------------------------------------------------
+
+def load_existing_manifest(live_dir: Path) -> dict:
+    """Return {chapter_id: content_hash} from the live projection's manifest."""
+    manifest_path = live_dir / MANIFEST_FILENAME
+    if not manifest_path.exists():
+        return {}
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, IOError):
+        return {}
+    entries = data.get("entries", []) if isinstance(data, dict) else []
+    return {int(e["chapter_id"]): e["content_hash"]
+            for e in entries
+            if "chapter_id" in e and "content_hash" in e}
+
+
+def write_manifest(chapters, mapping, note_hashes: Dict[int, str],
+                   staging_root: Path):
+    """Write the projection manifest to the staging dir."""
     manifest = {
         "generated_at": now_iso(),
+        "run_id": staging_root.name,
         "vault_dir": str(VAULT_DIR),
-        "items": [
+        "total_notes": len(chapters),
+        "entries": [
             {
                 "chapter_id": chapter["id"],
                 "title": chapter["title"],
                 "shelf": chapter["shelf"],
                 "path": mapping[chapter["id"]]["path"],
                 "source_path": chapter["source_path"],
+                "content_hash": note_hashes[chapter["id"]],
             }
             for chapter in chapters
         ],
     }
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (staging_root / MANIFEST_FILENAME).write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
 
+
+# ---------------------------------------------------------------------------
+# prune orphan notes
+# ---------------------------------------------------------------------------
+
+def prune_orphans(live_dir: Path, expected_paths: set):
+    """Remove notes in live_dir that are not in expected_paths."""
+    removed = 0
+    if not live_dir.exists():
+        return removed
+    for note_path in sorted(live_dir.rglob("*.md")):
+        rel = str(note_path.relative_to(live_dir))
+        # Skip manifest and special files
+        if rel.endswith(MANIFEST_FILENAME):
+            continue
+        if rel not in expected_paths:
+            note_path.unlink()
+            removed += 1
+    # Clean up empty directories
+    for dirpath in sorted(live_dir.rglob("*"), reverse=True):
+        if dirpath.is_dir() and dirpath != live_dir:
+            try:
+                dirpath.rmdir()
+            except OSError:
+                pass
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# atomic swap
+# ---------------------------------------------------------------------------
+
+def atomic_publish(staging_root: Path, live_dir: Path):
+    """Atomically swap staging dir into live/ via os.rename."""
+    # Remove old live dir if it exists
+    if live_dir.exists():
+        tmp = live_dir.parent / f".live-old-{staging_root.name}"
+        os.rename(str(live_dir), str(tmp))
+        import shutil
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    os.rename(str(staging_root), str(live_dir))
+
+
+# ---------------------------------------------------------------------------
+# check mode — drift detector
+# ---------------------------------------------------------------------------
+
+def check_mode(ids, live_dir: Path):
+    """Exit non-zero if the live projection differs from a fresh build."""
+    if not live_dir.exists():
+        raise SystemExit("ERROR: live projection does not exist — "
+                         "run without --check first")
+
+    # Write temp staging
+    staging = VAULT_DIR / STAGING_DIR_NAME / f"check-{int(time.time())}"
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        con = connect()
+        chapters = [fetch_chapter(con, cid) for cid in ids]
+        mapping = build_projection_map(chapters)
+        manifest_prev = load_existing_manifest(live_dir)
+        note_hashes: Dict[int, str] = {}
+        written = 0
+        unchanged = 0
+
+        for chapter in chapters:
+            result, h = write_note(chapter, mapping[chapter["id"]], mapping,
+                                   staging, manifest_prev)
+            note_hashes[chapter["id"]] = h
+            if result == "written":
+                written += 1
+            else:
+                unchanged += 1
+
+        expected = {mapping[c["id"]]["path"] for c in chapters}
+        orphans = prune_orphans(staging, expected)
+
+        if written > 0 or orphans > 0:
+            raise SystemExit(
+                f"DRIFT DETECTED: {written} changed, {orphans} orphan notes.\n"
+                f"  Run without --check to publish the latest projection."
+            )
+        print(f"CHECK OK: projection is up to date ({unchanged} notes unchanged)")
+    finally:
+        import shutil
+        shutil.rmtree(str(staging), ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Proyecta nodos de library.db a un vault de Obsidian")
+    parser = argparse.ArgumentParser(
+        description="Proyecta nodos de library.db a un vault de Obsidian "
+                    "(staging atomico + idempotente)")
     parser.add_argument("--ids", nargs="*", type=int, default=DEFAULT_IDS)
+    parser.add_argument("--check", action="store_true",
+                        help="exit non-zero if published projection differs "
+                             "from a fresh build (drift detector)")
     args = parser.parse_args()
 
     VAULT_DIR.mkdir(parents=True, exist_ok=True)
-    con = connect()
-    chapters = [fetch_chapter(con, cid) for cid in args.ids]
-    mapping = build_projection_map(chapters)
-    for chapter in chapters:
-        write_note(chapter, mapping[chapter["id"]], mapping)
-    write_index(mapping)
-    write_map_note(mapping)
-    write_manifest(chapters, mapping)
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "vault_dir": str(VAULT_DIR),
-                "exported": len(chapters),
-                "map_note": str(VAULT_DIR / "maps" / "project-memory-system.md"),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
+
+    fd = _lock_maintenance()
+    try:
+        con = connect()
+        chapters = [fetch_chapter(con, cid) for cid in args.ids]
+        mapping = build_projection_map(chapters)
+
+        live_dir = VAULT_DIR / LIVE_DIR_NAME
+        manifest_prev = load_existing_manifest(live_dir)
+
+        if args.check:
+            check_mode(args.ids, live_dir)
+            return
+
+        # Build into staging
+        run_id = f"build-{int(time.time())}"
+        staging_root = VAULT_DIR / STAGING_DIR_NAME / run_id
+        staging_root.mkdir(parents=True, exist_ok=True)
+
+        note_hashes: Dict[int, str] = {}
+        written = 0
+        unchanged = 0
+        for chapter in chapters:
+            result, h = write_note(chapter, mapping[chapter["id"]], mapping,
+                                    staging_root, manifest_prev)
+            note_hashes[chapter["id"]] = h
+            if result == "written":
+                written += 1
+            else:
+                unchanged += 1
+
+        write_index(mapping, staging_root)
+        write_map_note(mapping, staging_root)
+        write_manifest(chapters, mapping, note_hashes, staging_root)
+
+        # Prune orphans
+        expected_paths = {mapping[c["id"]]["path"] for c in chapters}
+        expected_paths.add("index.md")
+        expected_paths.add("maps/project-memory-system.md")
+        expected_paths.add(MANIFEST_FILENAME)
+        removed = prune_orphans(staging_root, expected_paths)
+
+        # Atomic publish
+        atomic_publish(staging_root, live_dir)
+
+        print(json.dumps({
+            "ok": True,
+            "vault_dir": str(VAULT_DIR),
+            "live_dir": str(live_dir),
+            "exported": len(chapters),
+            "written": written,
+            "unchanged": unchanged,
+            "removed_orphans": removed,
+            "map_note": str(live_dir / "maps" / "project-memory-system.md"),
+        }, indent=2, ensure_ascii=False))
+    finally:
+        _unlock_maintenance(fd)
 
 
 if __name__ == "__main__":

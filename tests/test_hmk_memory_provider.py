@@ -247,8 +247,14 @@ def test_system_prompt_block_hybrid_mode(
 
 # ---- required no-op methods ------------------------------------------------
 
-def test_get_tool_schemas_empty(provider_module):
-    assert provider_module.HMKMemoryProvider().get_tool_schemas() == []
+def test_get_tool_schemas_exposes_librarian(provider_module):
+    schemas = provider_module.HMKMemoryProvider().get_tool_schemas()
+    assert len(schemas) == 1
+    schema = schemas[0]
+    assert schema["name"] == "librarian"
+    actions = set(schema["parameters"]["properties"]["action"]["enum"])
+    # invariant: the full lifecycle is reachable, not a snapshot of the enum
+    assert {"query", "search", "add_text", "add_file", "expand", "update", "delete", "stats", "add_link"} <= actions
 
 
 def test_handle_tool_call_raises_not_implemented(provider_module):
